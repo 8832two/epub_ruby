@@ -1,95 +1,90 @@
-# epubhv
+# epub-ruby
 
-make your epub books vertical or horizontal.
+> 给 EPUB 日文书籍自动添加振假名（ruby/furigana）注音的工具。
 
-## You can use [streamlit](https://epubhv.streamlit.app)
+本项目基于 [yihong0618/epubhv](https://github.com/yihong0618/epubhv) 进行删改，是一个轻量级的 EPUB 日文注音处理工具。
 
-## Install
+## 功能
 
-```
-pip install epubhv
-or
-git clone https://github.com/yihong0618/epubhv.git
-cd epubhv && bash ./setup.sh
-```
+- **汉字 → 平假名**：自动为日文汉字标注平假名读音
+- **片假名外来语 → 英文**：识别片假名外来语并标注对应的英文含义
+- **批量处理**：支持单个 EPUB 文件或整个目录的批量注音
 
-## Using pipx
+## 原理
 
-If you are using [pipx](https://pypi.org/project/pipx/), you can directly run `epubhv` with:
+1. 解压 EPUB（本质是 ZIP 压缩包）
+2. 找到所有 HTML/XHTML 内容文件
+3. 使用 [fugashi](https://github.com/polm/fugashi)（MeCab 的 Python 封装）+ unidic_lite 词典进行日文分词和读音分析
+4. 在 HTML 中注入 `<ruby>` / `<rt>` / `<rp>` 标签
+5. 重新打包为新的 EPUB 文件
 
-```console
-pipx run epubhv a.epub
-```
+## 安装
 
-## Use the web
+```bash
+# 克隆仓库
+git clone https://github.com/8832two/epub_ruby.git
+cd epub_ruby
 
-```console
-pip install epubhv[web]
-streamlit run web.py
-```
+# 创建虚拟环境并安装
+python -m venv .venv
+source .venv/Scripts/activate  # Windows
+# 或 source .venv/bin/activate  # Linux/macOS
 
-## Use CLI
-
-```console
-epubhv a.epub # will generate a file a-v.epub that is vertical
-# or
-epubhv b.epub --h # will generate a file b-h.epub that is horizontal
-
-# if you also want to translate from `简体 -> 繁体`
-epubhv c.epub --convert s2t
-
-# if you also want to translate from `繁体 -> 简体`
-epubhv d.epub --h --convert t2s
-
-# or a folder contains butch of epubs
-epubhv tests/test_epub # will generate all epub files to epub-v
-
-# you can specify the punctuation style
-epubhv e.epub --convert s2t --punctuation auto
-# you can add `ruby` for Japanese(furigana) and Chinese(pinyin)
-epubhv e.epub --h --ruby
-# if you want to learn `cantonese` 粤语
-epubhv f.epub --h --ruby --cantonese
+pip install -e .
 ```
 
-**About [cantonese](https://jyutping.org/docs/cantonese/)**
+## 使用方法
 
-## Contribution
+```bash
+# 处理单个 EPUB 文件（输出到当前目录）
+epub-ruby book.epub
 
-- Any issues or PRs are welcome.
+# 指定输出目录
+epub-ruby book.epub -d ./output
 
-## Development
+# 批量处理整个目录
+epub-ruby ./books -d ./annotated
 
-```console
-# install all dependencies
-pdm install
-
-# format code
-pdm run format
-
-# run the following scripts and make sure all pass before you start a Pull Request
-pdm run all
+# 或以模块方式运行
+python -m epub_ruby book.epub
 ```
 
-## Thanks
+输出文件命名规则：`原文件名-ruby.epub`
 
-- @[tommyku](https://github.com/tommyku) --> [How to make EPUB ebooks with vertical layout?](https://blog.tommyku.com/blog/how-to-make-epubs-with-vertical-layout/)
-- @[jiak94](https://github.com/jiak94) support OpenCC
-- @[OverflowCat ](https://github.com/OverflowCat) add punctuation styles.
-- @[jt-wang](https://github.com/jt-wang) Type and PDM!
-- [furigana4epub](https://github.com/Mumumu4/furigana4epub)
-- [ToJyutping](https://github.com/CanCLID/ToJyutping)
-- [PDM](https://pdm.fming.dev/latest/)
-- [Streamlit](https://streamlit.io/)
+## 依赖
 
-## Similar projects
+- Python >= 3.8
+- [beautifulsoup4](https://pypi.org/project/beautifulsoup4/) — HTML 解析
+- [lxml](https://pypi.org/project/lxml/) — XML/HTML 引擎
+- [fugashi](https://pypi.org/project/fugashi/) — MeCab 分词器封装
+- [unidic_lite](https://pypi.org/project/unidic-lite/) — 日文词典
 
-- [EpubConv_Python](https://github.com/ThanatosDi/EpubConv_Python) found a similar project, seems we are not the only one need this, great thanks, appreciation and respect.
+## 已知局限
 
-## Appreciation
+当前使用基于词典的分词器（MeCab/unidic）进行读音推断，对于**多音字**（同一个汉字有多种读法）的注音准确率有限。例如「行く」（いく）和「旅行」（りょこう）中的「行」读音完全不同，分词器在复杂上下文中可能出错。
 
-- Thank you, that's enough. Just enjoy it.
+这是本项目的已知问题，**后续计划引入大模型（LLM）来优化多音字的注音准确性**。
 
-![image](https://github.com/yihong0618/epubhv/assets/15976103/6c6d77fc-6d3c-4814-b37c-badeba38cd03)
-![image](https://github.com/yihong0618/epubhv/assets/15976103/d8526e7c-abd2-42e2-92c8-d32300cec343)
-![image](https://github.com/yihong0618/epubhv/assets/15976103/685b789f-1850-43ed-b695-a70f86ec7dd0)
+## 项目结构
+
+```
+epub_ruby/
+├── pyproject.toml          # 项目配置
+├── README.md
+└── epub_ruby/
+    ├── __init__.py         # 包入口
+    ├── __main__.py         # python -m 入口
+    ├── cli.py              # 命令行解析
+    ├── core.py             # EPUB 解压/打包/调度
+    └── ruby.py             # 注音引擎（分词 + ruby 注入）
+```
+
+## 致谢
+
+- [yihong0618/epubhv](https://github.com/yihong0618/epubhv) — 原始项目
+- [Mumumu4/furigana4epub](https://github.com/Mumumu4/furigana4epub) — 注音引擎参考
+- [fugashi](https://github.com/polm/fugashi) — 日文分词器
+
+## License
+
+MIT
