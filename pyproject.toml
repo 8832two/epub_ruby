@@ -1,22 +1,66 @@
 [project]
 name = "epub-ruby"
-version = "0.1.0"
-requires-python = ">=3.8,!=3.9.7"
+version = "0.2.0"
+authors = [{name = "epub-ruby contributors"}]
+description = "Add Japanese furigana/ruby annotations to EPUB books"
 readme = "README.md"
-license = { text = "MIT" }
+requires-python = ">=3.8,!=3.9.7"
+license = {text = "MIT"}
+keywords = ["epub", "japanese", "furigana", "ruby", "nlp", "ai", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: Japanese",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Text Processing :: Linguistic",
+]
 
 dependencies = [
     "beautifulsoup4>=4.12.0",
     "lxml>=4.9.0",
     "soupsieve>=2.5",
-    "fugashi",
-    "unidic_lite",
+    "fugashi>=1.3.2",
+    "unidic_lite>=1.0.8",
     "openai>=1.0.0",
+    "google-genai>=1.0.0",
 ]
+
+[project.optional-dependencies]
+gui = ["pyside6>=6.5"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "black>=23.0"]
+config = ["pyyaml>=6.0"]
+
+[project.urls]
+Repository = "https://github.com/8832two/epub_ruby"
+Issues = "https://github.com/8832two/epub_ruby/issues"
 
 [project.scripts]
 epub-ruby = "epub_ruby.cli:main"
+epub-ruby-gui = "epub_ruby.gui:main"
 
 [build-system]
 requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+multi_line_mode = 3
+include_trailing_comma = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-ra --strict-markers -v"

@@ -1,163 +1,156 @@
-# epub-ruby
+<p align="center">
+  <h1 align="center">📖 epub-ruby</h1>
+  <p align="center"><b>为 EPUB 电子书自动添加日语振假名（ふりがな）</b></p>
+</p>
 
-> 给 EPUB 日文书籍自动添加振假名（ruby/furigana）的工具。  
-> 支持纯词典模式 + DeepSeek LLM 上下文感知模式。
-
-## 效果预览
-
-```
-原文：私は毎日日本語を勉強します
-标注：<ruby>私<rt>わたし</rt></ruby>は<ruby>毎日<rt>まいにち</rt></ruby>
-      <ruby>日本語<rt>にほんご</rt></ruby>を<ruby>勉強<rt>べんきょう</rt></ruby>します
-```
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.8+-blue" alt="Python">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey" alt="Platform">
+</p>
 
 ---
 
-## 功能
+## ✨ 功能
 
-| 功能 | 说明 |
-|---|---|
-| 汉字 → 平假名 | kanji → hiragana，含送假名（食べる → たべる） |
-| 片假名外来语 → 英文 | コンピュータ → computer |
-| LLM 上下文消歧 | DeepSeek 根据整句判断多音字正确读音 |
-| 批量并行 | 多个文件 / 多个 API batch 全部并行，无上限 |
-| 断网容错 | 自动重试 + 指数退避，失败降级为 fugashi 读音 |
-
----
-
-## 原理
-
-```
-EPUB (ZIP)
-  → 解压 → 找到 .xhtml/.html 文件
-    → fugashi (UniDic) 分词 → 识别需要注音的汉字词
-      → [LLM 模式] 批量发送含 fugashi 读音的句子给 DeepSeek
-        → LLM 只修正多音字错误，其余跳过（省 token）
-      → 注入 <ruby><rt> 标签
-  → 重新打包 → 输出 -ruby.epub
-```
-
-**LLM 模式的智能之处**：fugashi 先把所有词都标上读音，然后把整句 + 读音发给 DeepSeek："这些读音哪些是错的？只告诉我错的。"——LLM 不用从头算，只做 spot-check，大幅节省 token 和响应时间。
+- 🔤 **字典模式** — 基于 MeCab / UniDic 自动标注汉字读音，无需联网
+- 🤖 **LLM 增强** — 支持 DeepSeek、OpenAI、Gemini 等大模型，精准处理多音字
+- 🖥️ **图形界面** — PySide6 打造的现代化 GUI，拖拽即可处理
+- 📚 **批量处理** — 一次处理整个文件夹的所有 EPUB
+- ⚡ **并发加速** — 多线程 + API 并发池，大幅缩短处理时间
+- 🎨 **样式保留** — 完整保留原书 CSS、图片、排版
 
 ---
 
-## 安装
+## 📋 环境要求
+
+| 项目 | 说明 |
+|------|------|
+| Python | ≥ 3.8 |
+| 操作系统 | Windows / macOS / Linux |
+| 磁盘空间 | ~300 MB（含 UniDic 词典） |
+
+---
+
+## 🚀 快速开始
+
+### 方式一：一键启动（推荐）
+
+无需手动安装任何东西，下载项目后双击脚本即可：
+
+| 系统 | 脚本 |
+|------|------|
+| Windows | 双击 `run_gui.bat` |
+| macOS / Linux | 终端运行 `./run_gui.sh` |
+
+脚本会自动完成：
+1. 创建 Python 虚拟环境
+2. 安装全部依赖（首次约 1-2 分钟）
+3. 启动 GUI
+
+> 之后再次运行，检测到环境已就绪，直接秒开。
+
+### 方式二：源码安装
 
 ```bash
 git clone https://github.com/8832two/epub_ruby.git
 cd epub_ruby
+pip install -e ".[gui,config]"
+```
 
-python -m venv .venv
-source .venv/Scripts/activate   # Windows
-# source .venv/bin/activate     # Linux / macOS
+安装后可通过命令行使用：
 
-pip install -e .
+```bash
+# 启动 GUI
+epub-ruby-gui
+
+# 或命令行处理
+epub-ruby my-book.epub
 ```
 
 ---
 
-## 使用方法
-
-### 基本用法
+## 🖥️ 使用 GUI
 
 ```bash
-# 纯词典模式（无需 API key，速度快但多音字可能不准）
-epub-ruby book.epub
+epub-ruby-gui
+```
 
-# LLM 模式（推荐，上下文感知，解决多音字问题）
-epub-ruby book.epub --use-llm
+1. 点击 **文件 → 打开** 选择一个 `.epub` 文件（或直接拖入窗口）
+2. 在 **API 管理** 中配置 LLM（可选，不配则使用纯字典模式）
+3. 点击 **开始处理**
+4. 输出文件自动保存为 `原文件名-ruby.epub`
+
+---
+
+## ⌨️ 命令行使用
+
+```bash
+# 处理单个文件（字典模式）
+epub-ruby my-book.epub
 
 # 指定输出目录
-epub-ruby book.epub --use-llm -d ./output
+epub-ruby my-book.epub -d ./output/
 
 # 批量处理整个目录
-epub-ruby ./books --use-llm -d ./output
+epub-ruby ./my-library/
+
+# 使用 LLM 模式（需先设置 API Key）
+epub-ruby my-book.epub --llm
 ```
-
-### LLM 选项
-
-```bash
-# 设置 API Key（二选一）
-export DEEPSEEK_API_KEY="sk-..."
-# 或
-epub-ruby book.epub --use-llm --llm-api-key "sk-..."
-
-# 切换模型（默认 deepseek-v4-flash 速度快成本低）
-epub-ruby book.epub --use-llm --llm-model deepseek-v4-pro
-
-# 自定义 API 地址（兼容 OpenAI 等）
-epub-ruby book.epub --use-llm --llm-base-url "https://your-api.com"
-```
-
-### 完整参数
-
-```
-epub-ruby EPUB [选项]
-
-位置参数:
-  EPUB                  EPUB 文件或目录
-
-可选参数:
-  -d, --dest PATH       输出目录（默认当前目录）
-
-LLM 选项:
-  --use-llm             启用 DeepSeek API
-  --llm-model MODEL     模型名（deepseek-v4-flash / deepseek-v4-pro）
-  --llm-api-key KEY     API Key（默认读取 DEEPSEEK_API_KEY 环境变量）
-  --llm-base-url URL    API 地址
-```
-
-输出文件：`原文件名-ruby.epub`
 
 ---
 
-## 架构
+## 🤖 LLM 配置
+
+在 GUI 的 **API 管理** 页面添加 API，或设置环境变量：
+
+| 服务商 | 环境变量 |
+|--------|----------|
+| DeepSeek（推荐，便宜） | `DEEPSEEK_API_KEY` |
+| OpenAI | `OPENAI_API_KEY` |
+| Gemini | `GEMINI_API_KEY` |
+
+> DeepSeek 获取密钥：https://platform.deepseek.com/
+
+也可通过 `config.yaml` 配置，参考 `config.example.yaml`。
+
+---
+
+## 📁 项目结构
 
 ```
 epub_ruby/
-├── cli.py          命令行解析
-├── core.py         EPUB 解压/打包/并行调度
-├── ruby.py         注音引擎（fugashi 分词 + <ruby> 标签注入）
-├── llm_ruby.py     DeepSeek API 批量调用 + 重试 + 缓存
-├── __init__.py
-└── __main__.py
+├── run_gui.bat          # Windows 一键启动
+├── run_gui.sh           # macOS / Linux 一键启动
+├── epub_ruby/
+│   ├── gui.py           # 图形界面
+│   ├── cli.py           # 命令行入口
+│   ├── core.py          # 核心处理逻辑
+│   ├── ruby.py          # 振假名注入
+│   ├── llm_ruby.py      # LLM 注音
+│   ├── api_pool.py      # API 并发池
+│   └── config.py        # 配置管理
+├── config.example.yaml  # 配置文件模板
+├── pyproject.toml
+└── README.md
 ```
 
-### 并行策略
+---
 
-- 所有 HTML 文件**同时并行**处理（无上限）
-- 每个文件内的 API batch **同时并行**发出（无上限）
-- 网络错误自动重试 3 次（1s → 2s → 4s 退避），失败降级为 fugashi 读音
-- 实时输出带时间戳的进度日志
+## 🔧 故障排除
+
+| 问题 | 解决方案 |
+|------|----------|
+| `ModuleNotFoundError: PySide6` | 安装 GUI 依赖：`pip install -e ".[gui]"` |
+| API 调用失败 | 检查 API Key 是否正确，网络是否可访问 |
+| 处理速度慢 | 调大 `batch_size` 或增加 `max_concurrent` |
+| UniDic 下载失败 | 手动运行 `python -m unidic download` |
+
+错误日志位于 `~/.epub_ruby/errors.log`。
 
 ---
 
-## 依赖
+## 📄 许可证
 
-| 包 | 用途 |
-|---|---|
-| fugashi + unidic_lite | 日文分词 & 读音 |
-| beautifulsoup4 + lxml | HTML 解析 & 标签注入 |
-| openai | DeepSeek API 调用 |
-| Python ≥ 3.8 | |
-
----
-
-## 已知局限
-
-- 纯词典模式下，多音字（如「人」→ ひと/にん/じん）准确率有限
-- 极度依赖网络稳定性时建议使用 `deepseek-v4-flash`（快且便宜）
-- 片假名外来语的英文释义来自 UniDic 词典，部分新词可能缺失
-
----
-
-## 致谢
-
-- [yihong0618/epubhv](https://github.com/yihong0618/epubhv) — 原始项目框架
-- [Mumumu4/furigana4epub](https://github.com/Mumumu4/furigana4epub) — 注音引擎参考
-- [fugashi](https://github.com/polm/fugashi) — 日文分词
-- [DeepSeek](https://deepseek.com) — LLM API
-
-## License
-
-MIT
+MIT License

@@ -189,43 +189,61 @@ def generate_readings(sentence: str) -> Iterator[str | Tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 
+def _segment_text_with_llm_readings(
+    text: str, llm_readings: dict[str, str]
+) -> Iterator[str | Tuple[str, str]]:
+    """Annotate text using exact LLM reading substrings.
+
+    The LLM may return compound keys such as ``文庫本`` instead of
+    the tokenized pieces ``文庫`` and ``本``.  Match longest substrings
+    first so the correct compound reading is preserved.
+    """
+    if not llm_readings:
+        yield text
+        return
+
+    keys = sorted(llm_readings.keys(), key=len, reverse=True)
+    buffer: list[str] = []
+    i = 0
+    while i < len(text):
+        match = None
+        for key in keys:
+            if text.startswith(key, i):
+                match = key
+                break
+
+        if match is not None:
+            if buffer:
+                yield "".join(buffer)
+                buffer = []
+            yield (match, llm_readings[match])
+            i += len(match)
+            continue
+
+        buffer.append(text[i])
+        i += 1
+
+    if buffer:
+        yield "".join(buffer)
+
+
 def generate_readings_llm(
     sentence: str, llm_reader: "LLMRubyReader",
 ) -> Iterator[str | Tuple[str, str]]:
-    """Like :func:`generate_readings`, but uses DeepSeek LLM for kanji readings.
+    """Like :func:`generate_readings`, but lets the LLM self-tokenize.
 
-    Tokenization is still done by fugashi (reliable word boundaries).
-    Only words that *may* need ruby are sent to the LLM for context-aware
-    reading resolution.  Katakana loanwords still use fugashi's lemma.
+    The LLM receives the full sentence and returns the exact substrings
+    that should receive ruby annotation.  This avoids relying on fugashi
+    token boundaries for the final ruby output.
     """
-    tagger = _get_tagger()
-    words = list(tagger(sentence))
+    llm_readings = llm_reader.get_readings(sentence, [])
+    if llm_readings:
+        yield from _segment_text_with_llm_readings(sentence, llm_readings)
+        return
 
-    # Collect words needing ruby
-    words_for_llm: list[str] = []
-    word_entries: list[tuple[str, bool, str | None]] = []
-
-    for word in words:
-        surface, needs_ruby, reading = _classify_word(word)
-        word_entries.append((surface, needs_ruby, reading))
-        if needs_ruby:
-            words_for_llm.append(surface)
-
-    # Get LLM readings (one API call for the whole sentence)
-    llm_readings: dict[str, str] = {}
-    if words_for_llm:
-        llm_readings = llm_reader.get_readings(sentence, words_for_llm)
-
-    # Yield results: prefer LLM reading, fall back to fugashi
-    for surface, needs_ruby, fugashi_reading in word_entries:
-        if needs_ruby:
-            reading = llm_readings.get(surface, fugashi_reading)
-            if reading:
-                yield from _split_tail(surface, reading)
-            else:
-                yield surface
-        else:
-            yield surface
+    # Fall back to fugashi-based annotation if the LLM returns nothing.
+    for token in generate_readings(sentence):
+        yield token
 
 
 # ---------------------------------------------------------------------------
@@ -239,15 +257,18 @@ _ClassifiedWord = Tuple[str, bool, str | None]  # (surface, needs_ruby, reading)
 
 def _classify_and_collect(
     tagger: Tagger, text: str,
-) -> Tuple[Dict[str, str], List[_ClassifiedWord]]:
-    """Tokenize *text*, return both fugashi readings AND full classification.
+) -> Tuple[List[str], List[_ClassifiedWord]]:
+    """Tokenize *text*, return words needing LLM annotation AND full classification.
 
     Returns:
-        ``(fugashi_dict, classified)`` where *fugashi_dict* is
-        ``{word: fugashi_reading}`` for words needing LLM disambiguation,
-        and *classified* can be reused in pass 2 to avoid re-tokenizing.
+        ``(word_list, classified)`` where *word_list* is the list of
+        words (surface forms) that need ruby annotation, and *classified*
+        can be reused in pass 2 to avoid re-tokenizing.
+
+    Note: katakana loanwords with English lemma readings are excluded
+    from *word_list* (they are annotated directly by fugashi).
     """
-    fugashi_dict: Dict[str, str] = {}
+    word_list: List[str] = []
     classified: List[_ClassifiedWord] = []
     for word in tagger(text):
         surface, needs_ruby, reading = _classify_word(word)
@@ -256,14 +277,14 @@ def _classify_and_collect(
             # Skip katakana loanwords (lemma-based English readings)
             if not any("\u3040" <= ch <= "\u309F" for ch in reading):
                 continue
-            fugashi_dict[surface] = reading
-    return fugashi_dict, classified
+            word_list.append(surface)
+    return word_list, classified
 
 
 def _collect_words_for_llm(tagger: Tagger, text: str) -> List[str]:
-    """Tokenize *text* and return words that need LLM-assisted reading."""
-    fugashi_dict, _classified = _classify_and_collect(tagger, text)
-    return list(fugashi_dict.keys())
+    """Tokenize *text* and return words that need LLM annotation."""
+    word_list, _classified = _classify_and_collect(tagger, text)
+    return word_list
 
 
 def _generate_readings_from_cache(
@@ -273,17 +294,22 @@ def _generate_readings_from_cache(
 ) -> Iterator[str | Tuple[str, str]]:
     """Like :func:`generate_readings` but uses pre-computed LLM batch readings.
 
-    *batch_readings* contains LLM **corrections** (only words where fugashi
-    was wrong).  These are merged on top of fugashi's base readings.
+    *batch_readings* contains LLM's readings for each sentence.
+    Words the LLM did not annotate are left as plain text (no ruby).
+    There is NO fugashi fallback in LLM mode unless the LLM returns nothing
+    for the sentence.
     """
-    llm_corrections = batch_readings.get(text, {})
+    llm_readings = batch_readings.get(text, {})
+
+    if llm_readings:
+        yield from _segment_text_with_llm_readings(text, llm_readings)
+        return
 
     if pre_classified is not None:
         # Fast path: reuse pass-1 classification
-        for surface, needs_ruby, fugashi_reading in pre_classified:
+        for surface, needs_ruby, _fugashi_reading in pre_classified:
             if needs_ruby:
-                # LLM correction overrides fugashi
-                reading = llm_corrections.get(surface, fugashi_reading)
+                reading = llm_readings.get(surface)
                 if reading:
                     yield from _split_tail(surface, reading)
                 else:
@@ -295,9 +321,9 @@ def _generate_readings_from_cache(
     # Slow path: tokenize from scratch
     tagger = _get_tagger()
     for word in tagger(text):
-        surface, needs_ruby, fugashi_reading = _classify_word(word)
+        surface, needs_ruby, _fugashi_reading = _classify_word(word)
         if needs_ruby:
-            reading = llm_corrections.get(surface, fugashi_reading)
+            reading = llm_readings.get(surface)
             if reading:
                 yield from _split_tail(surface, reading)
             else:
@@ -305,19 +331,15 @@ def _generate_readings_from_cache(
         else:
             yield surface
 
-
-# ---------------------------------------------------------------------------
-# Ruby annotation injection
-# ---------------------------------------------------------------------------
-
-
 class RubySoup:
     """Injects ``<ruby>`` annotations into BeautifulSoup-parsed HTML content.
 
     Args:
         is_ruby_rp: Whether to emit ``<rp>`` fallback parentheses.
         llm_reader: Optional :class:`LLMRubyReader` for context-aware kanji
-            readings via DeepSeek API.  When ``None``, uses fugashi only.
+            readings via LLM API.  When provided, the LLM annotates ALL
+            kanji words purely from context (no dictionary hints).
+            There is NO fugashi fallback — failed batches are skipped.
     """
 
     def __init__(
@@ -327,7 +349,7 @@ class RubySoup:
     ) -> None:
         self._is_ruby_rp = is_ruby_rp
         self._llm_reader = llm_reader
-        # Pre-computed batch readings: {sentence: {word: reading}}
+        # Pre-computed LLM readings: {sentence: {word: reading}}
         self._batch_readings: Dict[str, Dict[str, str]] = {}
         # Pass-1 → Pass-2 classified-word cache: {sentence: [(surface, needs_ruby, reading), ...]}
         self._classified: Dict[str, List[_ClassifiedWord]] = {}
@@ -336,13 +358,13 @@ class RubySoup:
         """Recursively walk the soup tree and wrap text nodes with ``<ruby>`` tags.
 
         When using LLM, this does a TWO-PASS approach:
-        1. Collect ALL text segments and their kanji words from the tree
-        2. Make ONE batch API call for ALL segments
-        3. Apply readings to every text node
+        1. Collect ALL text segments from the tree
+        2. Make batch API calls (LLM self-tokenizes and annotates substrings)
+        3. Apply LLM readings to every text node
         """
-        # --- Pass 1: collect all (sentence, words) pairs (LLM mode only) ---
+        # --- Pass 1: collect all sentences for LLM self-tokenization ---
         if self._llm_reader is not None:
-            items: List[tuple[str, Dict[str, str]]] = []
+            items: List[tuple[str, List[str]]] = []
             self._collect_segments(soup, items)
             if items:
                 self._batch_readings = self._llm_reader.get_readings_batch(items)
@@ -358,13 +380,14 @@ class RubySoup:
 
     def _collect_segments(
         self, soup: BeautifulSoup | Tag,
-        items: List[tuple[str, Dict[str, str]]],
+        items: List[tuple[str, List[str]]],
     ) -> None:
-        """Walk the tree and collect (sentence, {word: fugashi_reading}) pairs.
+        """Walk the tree and collect sentence segments for LLM annotation.
 
-        Also caches full word classification so Pass 2 can skip tokenization.
+        In self-tokenization mode the LLM receives only the sentence text and
+        decides which substrings should receive furigana.  Fugashi is no longer
+        used to pre-split tokens for the LLM.
         """
-        tagger = _get_tagger()
         for child in soup.children:
             if child is None:
                 continue
@@ -378,10 +401,7 @@ class RubySoup:
                     segment = segment.strip()
                     if not segment:
                         continue
-                    fugashi_dict, classified = _classify_and_collect(tagger, segment)
-                    if fugashi_dict:
-                        items.append((segment, fugashi_dict))
-                        self._classified[segment] = classified
+                    items.append((segment, []))
             elif isinstance(child, Tag) and child.name not in ("ruby", "rt", "rp"):
                 self._collect_segments(child, items)
 
@@ -418,7 +438,7 @@ class RubySoup:
 
     def _build_ruby_segments(self, text: str) -> Iterator[str | Tag]:
         if self._llm_reader is not None:
-            # Use pre-computed batch readings + pass-1 classified cache
+            # Use pre-computed LLM readings + pass-1 classified cache
             pre = self._classified.get(text)
             readings = _generate_readings_from_cache(text, self._batch_readings, pre)
         else:
