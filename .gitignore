@@ -123,6 +123,9 @@ celerybeat.pid
 # Environments
 .env
 .venv
+
+# User config (may contain API keys)
+config.yaml
 env/
 venv/
 ENV/

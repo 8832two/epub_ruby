@@ -812,7 +812,7 @@ class MainWindow(QMainWindow):
     def _create_api_page(self):
         p = QWidget(); l = QVBoxLayout(p)
         l.setContentsMargins(20, 16, 20, 16); l.setSpacing(8)
-        hint = QLabel("按优先级排列，额度用尽自动切换下一个。仅在 API 之间切换，不降级到本地模式。")
+        hint = QLabel("按优先级排列，额度用尽自动切换下一个。")
         hint.setObjectName("hintLabel"); hint.setWordWrap(True)
         l.addWidget(hint)
 

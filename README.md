@@ -11,109 +11,84 @@
 
 ---
 
-## ✨ 功能
-
-- 🔤 **字典模式** — 基于 MeCab / UniDic 自动标注汉字读音，无需联网
-- 🤖 **LLM 增强** — 支持 DeepSeek、OpenAI、Gemini 等大模型，精准处理多音字
-- 🖥️ **图形界面** — PySide6 打造的现代化 GUI，拖拽即可处理
-- 📚 **批量处理** — 一次处理整个文件夹的所有 EPUB
-- ⚡ **并发加速** — 多线程 + API 并发池，大幅缩短处理时间
-- 🎨 **样式保留** — 完整保留原书 CSS、图片、排版
-
----
-
-## 📋 环境要求
-
-| 项目 | 说明 |
-|------|------|
-| Python | ≥ 3.8 |
-| 操作系统 | Windows / macOS / Linux |
-| 磁盘空间 | ~300 MB（含 UniDic 词典） |
-
----
-
 ## 🚀 快速开始
 
-### 方式一：一键启动（推荐）
+### Windows 用户（推荐）
 
-无需手动安装任何东西，下载项目后双击脚本即可：
+1. 📥 **[下载 epub-ruby-gui.exe](../../releases/latest/download/epub-ruby-gui.exe)**
+2. 双击运行，GUI 界面立即可用
 
-| 系统 | 脚本 |
-|------|------|
-| Windows | 双击 `run_gui.bat` |
-| macOS / Linux | 终端运行 `./run_gui.sh` |
+> 单文件独立运行，无需安装 Python 或任何依赖。
 
-脚本会自动完成：
-1. 创建 Python 虚拟环境
-2. 安装全部依赖（首次约 1-2 分钟）
-3. 启动 GUI
-
-> 之后再次运行，检测到环境已就绪，直接秒开。
-
-### 方式二：源码安装
+### macOS / Linux 用户
 
 ```bash
 git clone https://github.com/8832two/epub_ruby.git
 cd epub_ruby
-pip install -e ".[gui,config]"
-```
-
-安装后可通过命令行使用：
-
-```bash
-# 启动 GUI
-epub-ruby-gui
-
-# 或命令行处理
-epub-ruby my-book.epub
+./run_gui.sh          # 自动安装依赖并启动 GUI（首次约 1-2 分钟）
 ```
 
 ---
 
-## 🖥️ 使用 GUI
+## ✨ 功能
 
-```bash
-epub-ruby-gui
-```
+- 🔤 **字典模式** — MeCab / UniDic 自动标注汉字读音，无需联网
+- 🤖 **LLM 增强** — 支持 DeepSeek、OpenAI、Gemini，精准处理多音字
+- 🖥️ **图形界面** — 拖拽 EPUB 即可处理，支持批量
+- ⚡ **并发加速** — 多线程 + API 并发池
+- 🎨 **样式保留** — 完整保留原书 CSS、图片、排版
 
-1. 点击 **文件 → 打开** 选择一个 `.epub` 文件（或直接拖入窗口）
-2. 在 **API 管理** 中配置 LLM（可选，不配则使用纯字典模式）
+---
+
+## 🖥️ GUI 使用
+
+1. 将 `.epub` 文件拖入窗口（或 **文件 → 打开**）
+2. （可选）在 **API 管理** 中配置 LLM
 3. 点击 **开始处理**
-4. 输出文件自动保存为 `原文件名-ruby.epub`
+4. 输出为 `原文件名-ruby.epub`
 
----
+### 字典模式 vs LLM 模式
 
-## ⌨️ 命令行使用
-
-```bash
-# 处理单个文件（字典模式）
-epub-ruby my-book.epub
-
-# 指定输出目录
-epub-ruby my-book.epub -d ./output/
-
-# 批量处理整个目录
-epub-ruby ./my-library/
-
-# 使用 LLM 模式（需先设置 API Key）
-epub-ruby my-book.epub --llm
-```
+| | 字典模式 | LLM 模式 |
+|---|---|---|
+| 需要网络 | ❌ | ✅ |
+| 需要 API Key | ❌ | ✅ |
+| 准确度 | 较高 | 更高（处理多音字） |
 
 ---
 
 ## 🤖 LLM 配置
 
-在 GUI 的 **API 管理** 页面添加 API，或设置环境变量：
+在 GUI 的 **API 管理** 页面添加 API Key，或设置环境变量：
 
-| 服务商 | 环境变量 |
-|--------|----------|
-| DeepSeek（推荐，便宜） | `DEEPSEEK_API_KEY` |
-| OpenAI | `OPENAI_API_KEY` |
-| Gemini | `GEMINI_API_KEY` |
+| 服务商 | 环境变量 | 获取地址 |
+|--------|----------|----------|
+| DeepSeek（推荐） | `DEEPSEEK_API_KEY` | https://platform.deepseek.com |
+| OpenAI | `OPENAI_API_KEY` | https://platform.openai.com |
+| Gemini | `GEMINI_API_KEY` | https://aistudio.google.com/apikey |
 
-> DeepSeek 获取密钥：https://platform.deepseek.com/
+---
 
-也可通过 `config.yaml` 配置，参考 `config.example.yaml`。
+## ⌨️ 命令行（高级用户）
+
+```bash
+pip install -e ".[cli,config]"
+
+epub-ruby my-book.epub              # 字典模式
+epub-ruby my-book.epub --llm        # LLM 模式
+epub-ruby ./my-library/             # 批量处理
+```
+
+---
+
+## 🛠️ 自行打包
+
+```bash
+build_gui.bat           # Windows
+./build_gui.sh          # macOS / Linux
+```
+
+输出 `dist/epub-ruby-gui.exe`，单文件独立运行。
 
 ---
 
@@ -121,33 +96,19 @@ epub-ruby my-book.epub --llm
 
 ```
 epub_ruby/
-├── run_gui.bat          # Windows 一键启动
-├── run_gui.sh           # macOS / Linux 一键启动
-├── epub_ruby/
-│   ├── gui.py           # 图形界面
-│   ├── cli.py           # 命令行入口
-│   ├── core.py          # 核心处理逻辑
-│   ├── ruby.py          # 振假名注入
-│   ├── llm_ruby.py      # LLM 注音
-│   ├── api_pool.py      # API 并发池
-│   └── config.py        # 配置管理
-├── config.example.yaml  # 配置文件模板
-├── pyproject.toml
+├── epub_ruby_gui.spec    # PyInstaller 打包配置
+├── build_gui.bat / .sh   # 打包脚本
+├── run_gui.bat / .sh     # 源码启动脚本
+├── epub_ruby/            # 源代码
+│   ├── gui.py            # 图形界面
+│   ├── cli.py            # 命令行入口
+│   ├── core.py           # 核心处理
+│   ├── ruby.py           # 振假名注入
+│   ├── llm_ruby.py       # LLM 注音
+│   └── api_pool.py       # API 并发池
+├── config.example.yaml   # 配置文件模板
 └── README.md
 ```
-
----
-
-## 🔧 故障排除
-
-| 问题 | 解决方案 |
-|------|----------|
-| `ModuleNotFoundError: PySide6` | 安装 GUI 依赖：`pip install -e ".[gui]"` |
-| API 调用失败 | 检查 API Key 是否正确，网络是否可访问 |
-| 处理速度慢 | 调大 `batch_size` 或增加 `max_concurrent` |
-| UniDic 下载失败 | 手动运行 `python -m unidic download` |
-
-错误日志位于 `~/.epub_ruby/errors.log`。
 
 ---
 
