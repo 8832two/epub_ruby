@@ -1,12 +1,3 @@
-# Based on: https://github.com/yihong0618/epubhv
-"""
-Add Japanese furigana/ruby annotations to EPUB books.
-
-Supports:
-  - Kanji -> hiragana reading
-  - Katakana loanwords -> English reading
-"""
-
 from __future__ import annotations
 
 import shutil
@@ -75,7 +66,7 @@ class EPUBHV:
         llm_model: str = "deepseek-v4-flash",
         llm_api_key: Optional[str] = None,
         llm_base_url: str = "https://api.deepseek.com",
-        llm_batch_size: int = 60,
+        llm_batch_size: int = 200,
         llm_pool=None,
         llm_max_concurrent: int = 0,
         progress_callback: Optional[Callable[[int, int], None]] = None,
@@ -97,9 +88,9 @@ class EPUBHV:
         # Validate batch size
         if llm_batch_size < 1:
             _logger.warning(
-                f"Invalid batch_size={llm_batch_size}, using default (60)"
+                f"Invalid batch_size={llm_batch_size}, using default (200)"
             )
-            llm_batch_size = 60
+            llm_batch_size = 200
 
         self._epub_file = file_path
         self._book_name = file_path.stem
@@ -160,7 +151,7 @@ class EPUBHV:
     def _apply_ruby(self) -> None:
         """Inject <ruby> annotations into every HTML content file.
 
-        Two-phase approach for LLM mode:
+        Three-phase approach for LLM mode:
         1. Collect ALL sentences from all files (parallel, no API calls)
         2. ONE batch API call (internally parallel via ThreadPoolExecutor)
         3. Apply readings to all files (parallel, no API calls)
@@ -197,30 +188,29 @@ class EPUBHV:
         if self._use_llm and llm_reader is not None:
             # ── LLM mode: two-phase (collect → batch API → apply) ──
 
-            # Phase 1: collect all (sentence, words) from all files
-            all_items: list[tuple[str, list[str]]] = []
-            ruby_soups: list[RubySoup] = []
-            soups: list[BeautifulSoup] = []
+            # Phase 1: collect all sentences from all files
+            all_items: list[str] = []
+            # Store (ruby, soup, file) together – as_completed returns
+            # results in completion order, NOT submission order, so we
+            # must keep the file mapping instead of relying on zip().
+            file_triples: list[tuple[RubySoup, BeautifulSoup, Path]] = []
 
-            def _collect_one(html_file: Path) -> tuple[RubySoup, BeautifulSoup]:
+            def _collect_one(html_file: Path) -> tuple[RubySoup, BeautifulSoup, Path]:
                 raw = html_file.read_text(encoding="utf-8", errors="ignore")
                 soup = BeautifulSoup(raw, "html.parser",
                                      string_containers=string_containers)
                 ruby = RubySoup(is_ruby_rp=True, llm_reader=llm_reader)
                 if soup.body is not None:
                     ruby._collect_segments(soup.body, all_items)
-                return ruby, soup
+                return ruby, soup, html_file
 
             print(f"  [Phase 1] Collecting sentences from {total} file(s)...")
             with ThreadPoolExecutor(max_workers=total if total else 1) as executor:
                 futures = {executor.submit(_collect_one, f): f for f in files}
                 for future in as_completed(futures):
-                    try:
-                        ruby, soup = future.result()
-                        ruby_soups.append(ruby)
-                        soups.append(soup)
-                    except Exception as exc:
-                        print(f"  [ERROR] Collection failed: {exc}")
+                    # Propagate exceptions – don't silently skip failed files
+                    ruby, soup, f = future.result()
+                    file_triples.append((ruby, soup, f))
 
             # Phase 2: one batch API call (internally fully parallel)
             if all_items:
@@ -238,43 +228,44 @@ class EPUBHV:
 
                 print(f"  [Phase 2] {len(all_items)} sentences → LLM batch API...")
                 batch_readings = llm_reader.get_readings_batch(all_items)
+                if not batch_readings:
+                    from .exceptions import LLMBatchError
+                    raise LLMBatchError(
+                        f"LLM batch API returned empty readings for all "
+                        f"{len(all_items)} sentences"
+                    )
             else:
                 batch_readings = {}
                 total_chunks = 0
                 total_work = total
 
             # Phase 3: apply readings + write back
-            print(f"  [Phase 3] Applying readings to {len(ruby_soups)} file(s)...")
+            total_files = len(file_triples)
+            print(f"  [Phase 3] Applying readings to {total_files} file(s)...")
 
             def _apply_one(idx: int, ruby: RubySoup, soup: BeautifulSoup,
-                          html_file: Path) -> tuple[int, str]:
+                          html_file: Path) -> tuple[int, str, int]:
                 if soup.body is not None:
                     ruby._batch_readings = batch_readings
                     ruby._apply(soup.body)
                 html_file.write_text(str(soup), encoding="utf-8")
                 print(f"  [{idx}/{total}] {html_file.name}")
-                return (idx, html_file.name)
+                return (idx, html_file.name, ruby._skipped_count)
 
-            total_files = len(files)
             completed = 0
-            with ThreadPoolExecutor(max_workers=len(files) if len(files) else 1) as executor:
+            total_skipped = 0
+            with ThreadPoolExecutor(max_workers=total_files if total_files else 1) as executor:
                 futures2 = {
                     executor.submit(_apply_one, i, rs, sp, f): i
-                    for i, (rs, sp, f) in enumerate(
-                        zip(ruby_soups, soups, files), 1
-                    )
+                    for i, (rs, sp, f) in enumerate(file_triples, 1)
                 }
                 for future in as_completed(futures2):
-                    try:
-                        future.result()
-                        completed += 1
-                        if self._progress_callback:
-                            self._progress_callback(total_chunks + completed, total_work)
-                    except Exception as exc:
-                        print(f"  [ERROR] Apply failed: {exc}")
-                        completed += 1
-                        if self._progress_callback:
-                            self._progress_callback(total_chunks + completed, total_work)
+                    # Propagate exceptions – don't silently skip failed files
+                    idx, fname, skipped = future.result()
+                    total_skipped += skipped
+                    completed += 1
+                    if self._progress_callback:
+                        self._progress_callback(total_chunks + completed, total_work)
 
         else:
             # ── Dictionary mode: simple parallel ──
@@ -317,10 +308,29 @@ class EPUBHV:
                 f"{stats['total_annotated']} words annotated, "
                 f"{stats['cache_hits']} cache hits"
             )
+            if total_skipped > 0:
+                print(f"  [LLM] ⚠ {total_skipped} block(s) received no readings "
+                      f"from LLM (kept as plain text)")
             if stats["errors"]:
                 print(f"  [LLM] ⚠ {stats['errors']} batch(es) failed, "
                       f"{stats['total_failed']} sentences skipped – "
                       f"check error log")
+
+            # ── Fail fast: don't produce a bogus output file ──
+            if not llm_reader.any_batch_succeeded:
+                from .exceptions import LLMBatchError
+                if stats["total_annotated"] == 0:
+                    raise LLMBatchError(
+                        "LLM processing failed: zero words annotated. "
+                        "Check your API key / model name / quota."
+                    )
+                else:
+                    raise LLMBatchError(
+                        f"All {stats['api_calls']} API calls failed – "
+                        f"only cached readings ({stats['total_annotated']} words) "
+                        f"are available. Check your API configuration."
+                    )
+
             if stats["total_annotated"] == 0 and stats["api_calls"] > 0:
                 print(f"  [LLM] ⚠ WARNING: API called but ZERO words annotated! "
                       f"LLM may be returning empty results.")

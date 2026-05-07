@@ -11,11 +11,11 @@
 
 ---
 
-## 🚀 快速开始
+##  快速开始
 
 ### Windows 用户（推荐）
 
-1. 📥 **[下载 epub-ruby-gui.exe](../../releases/latest/download/epub-ruby-gui.exe)**
+1.  **[下载 epub-ruby-gui.exe](../../releases/latest/download/epub-ruby-gui.exe)**
 2. 双击运行，GUI 界面立即可用
 
 > 单文件独立运行，无需安装 Python 或任何依赖。
@@ -32,15 +32,15 @@ cd epub_ruby
 
 ## ✨ 功能
 
-- 🔤 **字典模式** — MeCab / UniDic 自动标注汉字读音，无需联网
-- 🤖 **LLM 增强** — 支持 DeepSeek、OpenAI、Gemini，精准处理多音字
-- 🖥️ **图形界面** — 拖拽 EPUB 即可处理，支持批量
-- ⚡ **并发加速** — 多线程 + API 并发池
-- 🎨 **样式保留** — 完整保留原书 CSS、图片、排版
+-  **字典模式** — MeCab / UniDic 自动标注汉字读音，无需联网
+-  **LLM 增强** — 支持 DeepSeek、OpenAI、Gemini，精准处理多音字
+-  **图形界面** — 拖拽 EPUB 即可处理，支持批量
+-  **并发加速** — 多线程 + API 并发池
+-  **样式保留** — 完整保留原书 CSS、图片、排版
 
 ---
 
-## 🖥️ GUI 使用
+##  GUI 使用
 
 1. 将 `.epub` 文件拖入窗口（或 **文件 → 打开**）
 2. （可选）在 **API 管理** 中配置 LLM
@@ -57,7 +57,7 @@ cd epub_ruby
 
 ---
 
-## 🤖 LLM 配置
+##  LLM 配置
 
 在 GUI 的 **API 管理** 页面添加 API Key，或设置环境变量：
 
@@ -69,7 +69,7 @@ cd epub_ruby
 
 ---
 
-## ⌨️ 命令行（高级用户）
+##  命令行（高级用户）
 
 ```bash
 pip install -e ".[cli,config]"
@@ -81,7 +81,7 @@ epub-ruby ./my-library/             # 批量处理
 
 ---
 
-## 🛠️ 自行打包
+##  自行打包
 
 ```bash
 build_gui.bat           # Windows
@@ -92,7 +92,7 @@ build_gui.bat           # Windows
 
 ---
 
-## 📁 项目结构
+##  项目结构
 
 ```
 epub_ruby/
@@ -112,6 +112,8 @@ epub_ruby/
 
 ---
 
-## 📄 许可证
+## 致谢
 
-MIT License
+本项目基于 [github.com/yihong0618/epubhv](https://github.com/yihong0618/epubhv) 修改而来，感谢原作者的杰出工作。
+
+---

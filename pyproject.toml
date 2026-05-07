@@ -1,6 +1,6 @@
 [project]
 name = "epub-ruby"
-version = "0.2.0"
+version = "0.3.0"
 authors = [{name = "epub-ruby contributors"}]
 description = "Add Japanese furigana/ruby annotations to EPUB books"
 readme = "README.md"

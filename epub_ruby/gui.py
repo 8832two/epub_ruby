@@ -346,7 +346,7 @@ class APIEditDialog(QDialog):
     MODEL_SUGGESTIONS = {
         "deepseek": ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat"],
         "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"],
-        "gemini": ["gemini-2.5-flash-preview", "gemini-2.5-pro-preview", "gemini-2.0-flash"],
+        "gemini": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
     }
 
     def __init__(self, parent=None, edit_data=None):
@@ -528,38 +528,24 @@ class ProcessWorker(QThread):
                     self.status_signal.emit(
                         f"LLM: {self._model or '默认模型'}")
 
-            # ── Pre-scan: count total HTML content files across all EPUBs ──
-            self.status_signal.emit("正在扫描文件...")
-            total_html = 0
-            for f in files:
-                try:
-                    p = EPUBHV(f)
-                    p._extract()
-                    p._collect_content_files()
-                    total_html += len(p._content_files)
-                    p._cleanup()
-                except Exception as e:
-                    _logger.warning("pre-scan %s: %s", f.name, e)
-            self.status_signal.emit(f"共 {total_html} 个内容文件待处理")
-            self.progress_signal.emit(0, total_html)
+            # ── Simple file count (no pre-scan extraction needed) ──
+            total_files = len(files)
+            self.status_signal.emit(f"共 {total_files} 个 EPUB 文件")
+            self.progress_signal.emit(0, total_files)
 
-            # ── Process files with per-HTML-file progress ──
-            processed_html = [0]  # mutable counter shared by closures
-
+            # ── Process files ──
             for epub_idx, f in enumerate(files):
                 self.status_signal.emit(
                     f"[{epub_idx+1}/{len(files)}] {f.name}")
 
-                # Factory: each EPUB gets a callback that uses the values from core.py
-                def make_progress_cb(counter):
+                # Factory: each EPUB gets a callback
+                def make_progress_cb():
                     def cb(current, total):
-                        # Use (current, total) as reported — core.py now combines
-                        # LLM batch progress + file-write progress into one scale
                         self.progress_signal.emit(current, total)
                     return cb
 
                 kwargs_with_pb = {**kwargs,
-                                  "progress_callback": make_progress_cb(processed_html)}
+                                  "progress_callback": make_progress_cb()}
 
                 try:
                     processor = EPUBHV(f, **kwargs_with_pb)
@@ -572,7 +558,7 @@ class ProcessWorker(QThread):
                     _logger.error(
                         "FAIL %s: %s\n%s", f.name, e, traceback.format_exc())
 
-            self.progress_signal.emit(total_html, total_html)
+            self.progress_signal.emit(total_files, total_files)
 
             # LLM stats summary
             if self._use_llm:
@@ -602,9 +588,11 @@ class ProcessWorker(QThread):
 class MainWindow(QMainWindow):
     PAGE_IO, PAGE_PROC, PAGE_API, PAGE_HELP = 0, 1, 2, 3
 
+    VERSION = "0.3.0"
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("EPUB Ruby")
+        self.setWindowTitle(f"EPUB Ruby v{self.VERSION}")
         self.setMinimumSize(720, 560); self.resize(860, 620)
         self._worker = None
         self._config = load_config()
@@ -739,10 +727,10 @@ class MainWindow(QMainWindow):
         br = QHBoxLayout(); br.setSpacing(8)
         br.addWidget(QLabel("批次:"))
         self._batch_slider = QSlider(Qt.Orientation.Horizontal)
-        self._batch_slider.setRange(5, 200); self._batch_slider.setValue(60)
-        self._batch_slider.setTickInterval(25); self._batch_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self._batch_slider.setRange(5, 500); self._batch_slider.setValue(200)
+        self._batch_slider.setTickInterval(50); self._batch_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         br.addWidget(self._batch_slider, 1)
-        self._batch_spin = QSpinBox(); self._batch_spin.setRange(5, 200); self._batch_spin.setValue(60)
+        self._batch_spin = QSpinBox(); self._batch_spin.setRange(5, 500); self._batch_spin.setValue(200)
         self._batch_spin.setSuffix(" 句/次"); self._batch_spin.setFixedWidth(90)
         self._batch_slider.valueChanged.connect(self._batch_spin.setValue)
         self._batch_spin.valueChanged.connect(self._batch_slider.setValue)
@@ -836,8 +824,9 @@ class MainWindow(QMainWindow):
         p = QWidget(); l = QVBoxLayout(p)
         l.setContentsMargins(20, 16, 20, 16)
         b = QTextBrowser(); b.setOpenExternalLinks(True)
-        b.setHtml("""
-<h3>EPUB Ruby — 振假名标注工具</h3>
+        version = "0.3.0"
+        b.setHtml(f"""
+<h3>EPUB Ruby v{version} — 振假名标注工具</h3>
 <p>为 EPUB 日文书籍自动添加振假名（ruby / furigana），让阅读更轻松。</p>
 
 <p><b>基本用法</b></p>
@@ -862,8 +851,9 @@ class MainWindow(QMainWindow):
 
 <p style="margin-top:24px;"><a href="https://github.com/8832two/epub_ruby">GitHub</a></p>
 <p style="color:#999;font-size:11px;">
-普通模式提供: 分词 fugashi / UniDic &nbsp;·&nbsp; EPUB 处理 epubhv
+普通模式提供: 分词 fugashi / UniDic &nbsp;·&nbsp; EPUB 处理 EPUBHV
 <br>LLM 模式提供: @8832xb
+<br>本项目基于 <a href="https://github.com/yihong0618/epubhv">github.com/yihong0618/epubhv</a> 修改而来
 </p>
 """)
         l.addWidget(b, 1)
@@ -917,7 +907,9 @@ class MainWindow(QMainWindow):
 
     def _get_api_row(self, row):
         its = [self._api_table.item(row, c) for c in range(4)]
-        return {"provider": its[0].text() if its[0] else "", "api_key": its[1].text() if its[1] else "",
+        ki = its[1]
+        key = (ki.data(Qt.ItemDataRole.UserRole) or ki.text()) if ki else ""
+        return {"provider": its[0].text() if its[0] else "", "api_key": key,
                 "model": its[2].text() if its[2] else "", "base_url": its[3].text() if its[3] else ""}
 
     def _set_api_row(self, row, data):
@@ -968,20 +960,18 @@ class MainWindow(QMainWindow):
         od = self._output_input.text().strip() or "./output"
         use_llm = self._proc_tabs.currentIndex() == 1
 
+        # Refresh api_configs from table (in case user edited inline)
+        self._api_configs = self._get_api_configs()
+
         if use_llm and not self._api_configs:
             if not self._default_api_key.text().strip():
-                reply = QMessageBox.question(
+                QMessageBox.warning(
                     self, "LLM 模式",
                     "未配置 API 池，也未设置默认 API Key。\n"
                     "LLM 模式需要至少一个 API 才能工作。\n\n"
-                    "是否切换到普通模式？",
-                    QMessageBox.StandardButton.Yes |
-                    QMessageBox.StandardButton.No)
-                if reply == QMessageBox.StandardButton.Yes:
-                    self._proc_tabs.setCurrentIndex(0)
-                    use_llm = False
-                else:
-                    return
+                    "请切换到「普通模式」标签页使用词典模式，\n"
+                    "或在「API 管理」页配置 API 池。")
+                return
 
         self._save_config_from_ui()
         self._set_controls_enabled(False)

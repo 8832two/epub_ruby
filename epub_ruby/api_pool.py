@@ -131,6 +131,48 @@ def _is_quota_error(error: Exception) -> bool:
     return False
 
 
+# HTTP status codes that indicate a *permanent* failure (retrying won't help)
+_PERMANENT_STATUS_CODES = {404, 401, 400}
+
+# Substrings in error messages that suggest a permanent failure
+_PERMANENT_MESSAGE_PATTERNS = [
+    "not found", "NOT_FOUND", "not supported",
+    "invalid api key", "invalid_api_key", "unauthorized",
+    "permission denied", "access denied",
+    "model is not", "does not exist",
+    "bad request", "invalid model",
+]
+
+
+def _is_permanent_error(error: Exception) -> bool:
+    """Heuristic: is this error a *permanent* failure (retrying won't help)?
+
+    Permanent errors include: model not found (404), invalid API key (401),
+    bad request (400).  These should stop the entire operation immediately.
+    """
+    msg = str(error)
+    for pattern in _PERMANENT_MESSAGE_PATTERNS:
+        if pattern.lower() in msg.lower():
+            return True
+
+    # Check for HTTP status codes
+    for attr in ("status_code", "code", "http_status", "status"):
+        val = getattr(error, attr, None)
+        if val in _PERMANENT_STATUS_CODES:
+            return True
+
+    http_status = getattr(error, "http_status", None)
+    if http_status in _PERMANENT_STATUS_CODES:
+        return True
+
+    # Check nested __cause__
+    cause = getattr(error, "__cause__", None)
+    if cause is not None:
+        return _is_permanent_error(cause)
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Pool statistics
 # ---------------------------------------------------------------------------
@@ -158,7 +200,16 @@ class APIQuotaExhaustedError(Exception):
 
 
 class APIPoolExhaustedError(Exception):
-    """Raised when ALL providers in the pool have been exhausted."""
+    """Raised when ALL providers in the pool have been exhausted.
+
+    Attributes:
+        earliest_resume: Earliest time (Unix timestamp) when any paused
+            provider will become available again, or 0 if unknown.
+    """
+
+    def __init__(self, *args: Any, earliest_resume: float = 0.0) -> None:
+        super().__init__(*args)
+        self.earliest_resume = earliest_resume
 
 
 class APIPool:
@@ -215,6 +266,12 @@ class APIPool:
         self._lock = threading.Lock()
         self._stats = PoolStats()
 
+        # Permanent failure: when a provider returns a non-retryable error
+        # (e.g. 404 model not found), the entire pool is marked dead so
+        # subsequent calls fail immediately instead of wasting time.
+        self._dead: bool = False
+        self._dead_reason: str = ""
+
         # Lazy-initialized clients
         self._openai_clients: Dict[int, Any] = {}   # config_index -> OpenAI client
         self._gemini_clients: Dict[int, Any] = {}   # config_index -> genai.Client
@@ -240,6 +297,45 @@ class APIPool:
         """Number of providers in the pool."""
         return len(self._configs)
 
+    @property
+    def dead(self) -> bool:
+        """``True`` when the pool has suffered a permanent, non-retryable error.
+
+        Examples: model not found (404), invalid API key (401).
+        When dead, all subsequent API calls fail immediately.
+        """
+        return self._dead
+
+    @property
+    def dead_reason(self) -> str:
+        """Human-readable reason why the pool is dead (empty if alive)."""
+        return self._dead_reason
+
+    @property
+    def all_paused(self) -> bool:
+        """``True`` when every provider is currently paused (quota/rate-limit)."""
+        with self._lock:
+            now = time.time()
+            return all(
+                self._paused_until.get(i, 0) > now
+                for i in range(len(self._configs))
+            )
+
+    @property
+    def earliest_resume_time(self) -> float:
+        """Earliest Unix timestamp when any paused provider will be available.
+
+        Returns 0 if no providers are paused.
+        """
+        with self._lock:
+            now = time.time()
+            paused_times = [
+                self._paused_until.get(i, 0)
+                for i in range(len(self._configs))
+                if self._paused_until.get(i, 0) > now
+            ]
+            return min(paused_times) if paused_times else 0.0
+
     # ------------------------------------------------------------------
     # High-level API methods
     # ------------------------------------------------------------------
@@ -250,6 +346,7 @@ class APIPool:
         user_prompt: str,
         model: str = "",
         temperature: float = 0.1,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Unified LLM call – works across all providers.
 
@@ -257,12 +354,16 @@ class APIPool:
         system + user messages.  For Gemini, merges prompts into a
         single content string with system instruction.
 
+        Args:
+            response_format: OpenAI-compatible response format dict
+                (e.g. ``{"type": "json_object"}``).  Ignored by Gemini.
+
         Returns the text content.  Auto-fails over on quota errors.
         """
         return self._call_with_failover(
             lambda cfg, client: self._do_llm_call(
                 cfg, client, system_prompt, user_prompt,
-                model or cfg.model, temperature,
+                model or cfg.model, temperature, response_format,
             )
         )
 
@@ -311,7 +412,16 @@ class APIPool:
 
         *fn* receives ``(APIConfig, client)`` and must return ``str``.
         On quota errors, the current provider is paused and the next is tried.
+
+        On *permanent* errors (404 model not found, 401 auth, etc.), the
+        pool is marked dead and all subsequent calls fail immediately.
         """
+        # ── Fast path: pool is dead from a previous permanent error ──
+        if self._dead:
+            raise APIPoolExhaustedError(
+                f"Pool is dead: {self._dead_reason}"
+            )
+
         last_error: Optional[Exception] = None
 
         with self._lock:
@@ -336,6 +446,10 @@ class APIPool:
                 client = self._get_client(idx, cfg)
             except Exception as exc:
                 self._log(f"[{cfg.provider}] Client init failed: {exc}")
+                if _is_permanent_error(exc):
+                    self._dead = True
+                    self._dead_reason = f"{cfg.provider}: {exc}"
+                    break
                 self._pause_provider(idx)
                 self._advance_index()
                 last_error = exc
@@ -363,18 +477,39 @@ class APIPool:
                     self._stats.total_retries += 1
                     self._stats.provider_errors[cfg.provider] = \
                         self._stats.provider_errors.get(cfg.provider, 0) + 1
-                # Non-quota error → also try next provider
+
+                # Permanent error → kill the pool immediately
+                if _is_permanent_error(exc):
+                    self._dead = True
+                    self._dead_reason = f"{cfg.provider}: {exc}"
+                    last_error = exc
+                    break
+
+                # Transient error → try next provider
                 self._advance_index()
                 last_error = exc
 
-        # All providers exhausted
+        # All providers exhausted (or pool dead)
+        if self._dead:
+            reason = self._dead_reason
+            with self._lock:
+                self._stats.errors.append(
+                    f"{datetime.now().isoformat()} | Pool dead: {reason}"
+                )
+            raise APIPoolExhaustedError(
+                f"Pool dead (permanent error): {reason}",
+                earliest_resume=0,
+            )
+
+        earliest = self.earliest_resume_time
         with self._lock:
             self._stats.errors.append(
                 f"{datetime.now().isoformat()} | All providers exhausted. "
                 f"Last error: {last_error}"
             )
         raise APIPoolExhaustedError(
-            f"All {n} API provider(s) exhausted. Last error: {last_error}"
+            f"All {n} API provider(s) exhausted. Last error: {last_error}",
+            earliest_resume=earliest,
         )
 
     # ------------------------------------------------------------------
@@ -389,11 +524,15 @@ class APIPool:
         user_prompt: str,
         model: str,
         temperature: float,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Execute an LLM call, adapting to the provider type."""
         provider = Provider(cfg.provider)
 
         if provider in (Provider.DEEPSEEK, Provider.OPENAI):
+            kwargs: Dict[str, Any] = {}
+            if response_format is not None:
+                kwargs["response_format"] = response_format
             return self._do_chat_completion(
                 client,
                 messages=[
@@ -402,6 +541,7 @@ class APIPool:
                 ],
                 model=model,
                 temperature=temperature,
+                **kwargs,
             )
         elif provider == Provider.GEMINI:
             # Merge system + user into single contents, use system_instruction

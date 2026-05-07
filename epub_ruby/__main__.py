@@ -1,5 +1,4 @@
-# Based on: https://github.com/yihong0618/epubhv
-"""Allow running the package via ``python -m epub_ruby``."""
+"""允许通过 ``python -m epub_ruby`` 运行 CLI 入口。"""
 
 from .cli import main
 

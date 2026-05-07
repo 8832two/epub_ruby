@@ -26,7 +26,7 @@ class Config:
     llm_model: str = "deepseek-v4-flash"
     llm_api_key: Optional[str] = None
     llm_base_url: str = "https://api.deepseek.com"
-    llm_batch_size: int = 60
+    llm_batch_size: int = 200
     llm_max_concurrent: int = 0
 
     # Processing
@@ -49,7 +49,7 @@ class Config:
                 "EPUB_RUBY_LLM_BASE_URL",
                 "https://api.deepseek.com"
             ),
-            llm_batch_size=int(os.getenv("EPUB_RUBY_BATCH_SIZE", "60")),
+            llm_batch_size=int(os.getenv("EPUB_RUBY_BATCH_SIZE", "200")),
             llm_max_concurrent=int(os.getenv("EPUB_RUBY_MAX_CONCURRENT", "0")),
             output_dir=Path(os.getenv("EPUB_RUBY_OUTPUT_DIR")) if
             os.getenv("EPUB_RUBY_OUTPUT_DIR") else None,
@@ -93,7 +93,7 @@ class Config:
             llm_model=llm_cfg.get("model", "deepseek-v4-flash"),
             llm_api_key=llm_cfg.get("api_key"),
             llm_base_url=llm_cfg.get("base_url", "https://api.deepseek.com"),
-            llm_batch_size=llm_cfg.get("batch_size", 60),
+            llm_batch_size=llm_cfg.get("batch_size", 200),
             llm_max_concurrent=llm_cfg.get("max_concurrent", 0),
             num_workers=proc_cfg.get("num_workers", 0),
             output_dir=Path(proc_cfg.get("output_dir"))

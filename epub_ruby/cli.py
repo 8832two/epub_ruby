@@ -1,5 +1,11 @@
-# Based on: https://github.com/yihong0618/epubhv
-"""CLI for adding Japanese ruby/furigana annotations to EPUB files."""
+"""
+命令行接口 — 为 EPUB 文件添加日语振假名注音。
+
+支持：
+  - 传统 fugashi 词典模式
+  - LLM 上下文感知模式（--use-llm）
+  - 多 API 提供商池（--api 可多次指定，自动故障切换）
+"""
 
 from __future__ import annotations
 
@@ -92,8 +98,8 @@ def main() -> None:
     llm_group.add_argument(
         "--batch-size",
         type=int,
-        default=60,
-        help="Max sentences per API call (default: 60). Lower = faster response, higher = fewer calls.",
+        default=200,
+        help="Max sentences per API call (default: 200). Larger = fewer API calls = less token waste.",
     )
 
     # Concurrency limit
