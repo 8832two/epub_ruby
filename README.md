@@ -15,7 +15,8 @@
 
 ### Windows 用户（推荐）
 
-1.  **[下载 epub-ruby-gui.exe](../../releases/latest/download/epub-ruby-gui.exe)**
+1.  **[下载 epub-ruby-gui.exe](../../releases/latest/download/epub-ruby-v0.3.0.exe
+)**
 2. 双击运行，GUI 界面立即可用
 
 > 单文件独立运行，无需安装 Python 或任何依赖。
