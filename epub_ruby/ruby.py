@@ -290,15 +290,16 @@ def _generate_readings_from_cache(
     conflicts = set(katakana_readings) & set(llm_readings)
     if conflicts:
         _logger = logging.getLogger("epub_ruby")
-        _logger.error(
+        _logger.warning(
             "Dict merge conflict! LLM tried to annotate katakana word(s): %s. "
-            "Sentence: %s",
+            "Sentence: %s — keeping katakana reading, discarding LLM's.",
             sorted(conflicts), text[:80]
         )
-        raise ValueError(
-            f"LLM annotated katakana word(s) that belong to the dictionary "
-            f"domain: {sorted(conflicts)}. This is an LLM output bug."
-        )
+        # Filter out conflicting keys from LLM readings — katakana dict
+        # takes precedence.  Don't crash the entire EPUB just because
+        # the LLM made a mistake on one sentence.
+        llm_readings = {k: v for k, v in llm_readings.items()
+                        if k not in conflicts}
 
     merged: dict[str, str] = {**katakana_readings, **llm_readings}
 

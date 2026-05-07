@@ -53,6 +53,14 @@ _H2K = str.maketrans(_HIRAGANA_CHART, _KATAKANA_CHART)
 # 提取纯英文（去除数字、符号等）
 _ENGLISH_ONLY_RE = re.compile(r"[^a-zA-Z\s]")
 
+# 片假名检测（用于过滤非片假名词条）
+_KATAKANA_RANGE_RE = re.compile(r"[\u30A0-\u30FF]")
+
+
+def _contains_katakana(text: str) -> bool:
+    """Return ``True`` if *text* contains at least one katakana character."""
+    return bool(_KATAKANA_RANGE_RE.search(text))
+
 
 def katakana_to_hiragana(text: str) -> str:
     """将片假名转换为平假名。"""
@@ -122,6 +130,11 @@ def extract_katakana_readings(text: str) -> Dict[str, str]:
 
         english = _extract_english_from_lemma(lemma)
         if english:
+            # 只收录真正的片假名词（surface 中包含片假名字符）。
+            # UniDic 的 lemma 字段对某些汉字词也可能包含 "-英文"
+            # 格式（如 "浪漫-romantic"），必须过滤掉这些非片假名词。
+            if not _contains_katakana(surface):
+                continue
             # 避免重复键（相同片假名出现多次时取首次的释义）
             if surface not in result:
                 result[surface] = english

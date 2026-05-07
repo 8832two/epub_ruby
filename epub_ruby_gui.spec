@@ -7,10 +7,14 @@ PyInstaller spec file for epub-ruby GUI (single-file)
 
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_data_files
+
 _here = Path(SPECPATH)
 
 # ── 额外数据文件 ──
 _datas = []
+# 收集 unidic_lite 词典数据（fugashi 运行时需要 dicdir/ 下的文件）
+_datas += collect_data_files("unidic_lite")
 _readme = _here / "README.md"
 if _readme.exists():
     _datas.append((str(_readme), "."))

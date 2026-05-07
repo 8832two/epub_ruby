@@ -344,7 +344,7 @@ def save_config(cfg):
 class APIEditDialog(QDialog):
     PROVIDERS = ["deepseek", "openai", "gemini"]
     MODEL_SUGGESTIONS = {
-        "deepseek": ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat"],
+        "deepseek": ["deepseek-chat", "deepseek-v4-flash", "deepseek-v4-pro"],
         "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"],
         "gemini": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
     }
@@ -762,7 +762,7 @@ class MainWindow(QMainWindow):
         fr = QHBoxLayout(); fr.setSpacing(6)
         fr.addWidget(QLabel("模型:"))
         self._default_model = QLineEdit()
-        self._default_model.setPlaceholderText("deepseek-v4-flash")
+        self._default_model.setPlaceholderText("deepseek-chat")
         self._default_model.setMaximumWidth(200)
         fr.addWidget(self._default_model)
         fr.addWidget(QLabel("Key:"))

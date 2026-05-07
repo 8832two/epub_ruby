@@ -380,7 +380,14 @@ class APIPool:
         """
         return self._call_with_failover(
             lambda cfg, client: self._do_chat_completion(
-                client, messages, model or cfg.model, temperature, **kwargs
+                client, messages, model or cfg.model, temperature,
+                **kwargs,
+                **(
+                    {"extra_body": {"thinking": {"type": "disabled"}}}
+                    if Provider(cfg.provider) == Provider.DEEPSEEK
+                    and "extra_body" not in kwargs
+                    else {}
+                ),
             )
         )
 
@@ -533,6 +540,9 @@ class APIPool:
             kwargs: Dict[str, Any] = {}
             if response_format is not None:
                 kwargs["response_format"] = response_format
+            # DeepSeek: disable thinking/reasoning to reduce latency and token cost
+            if provider == Provider.DEEPSEEK:
+                kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
             return self._do_chat_completion(
                 client,
                 messages=[

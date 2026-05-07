@@ -23,7 +23,7 @@ class Config:
 
     # LLM settings
     use_llm: bool = False
-    llm_model: str = "deepseek-v4-flash"
+    llm_model: str = "deepseek-chat"
     llm_api_key: Optional[str] = None
     llm_base_url: str = "https://api.deepseek.com"
     llm_batch_size: int = 200
@@ -43,7 +43,7 @@ class Config:
         """Load configuration from environment variables."""
         return cls(
             use_llm=os.getenv("EPUB_RUBY_USE_LLM", "false").lower() == "true",
-            llm_model=os.getenv("EPUB_RUBY_LLM_MODEL", "deepseek-v4-flash"),
+            llm_model=os.getenv("EPUB_RUBY_LLM_MODEL", "deepseek-chat"),
             llm_api_key=os.getenv("DEEPSEEK_API_KEY"),
             llm_base_url=os.getenv(
                 "EPUB_RUBY_LLM_BASE_URL",
@@ -90,7 +90,7 @@ class Config:
 
         return cls(
             use_llm=llm_cfg.get("use_llm", False),
-            llm_model=llm_cfg.get("model", "deepseek-v4-flash"),
+            llm_model=llm_cfg.get("model", "deepseek-chat"),
             llm_api_key=llm_cfg.get("api_key"),
             llm_base_url=llm_cfg.get("base_url", "https://api.deepseek.com"),
             llm_batch_size=llm_cfg.get("batch_size", 200),

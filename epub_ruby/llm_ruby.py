@@ -227,7 +227,7 @@ For each numbered input line, find ALL kanji words and return their hiragana rea
 CRITICAL FORMAT RULES:
 - Output ONLY: {"r":[{...},{...},...]}
 - One {...} object per input line, in the SAME order
-- Each key is a kanji word EXACTLY as it appears in the input
+- Each key is a kanji word EXACTLY as it appears in the input — do NOT use "kanji" or "word" as the key!
 - Each value is PURE HIRAGANA only — no "=", no "()", no spaces, no notes
 - Use {} for lines with no kanji
 
@@ -235,6 +235,7 @@ READING VALUE FORMAT:
   "kanji":"hiragana_only"
   ✓ "勉強":"べんきょう", "走った":"はしった", "周囲":"しゅうい"
   ✗ "勉強":"べんきょう=study", "走":"はしった (ran)", "周囲":"しゅういに=に"
+  ✗ {"kanji":"はしった"} — NEVER use "kanji" as the key! Use the actual word!
 
 EXAMPLES:
 
@@ -257,6 +258,7 @@ PREVIOUS OUTPUT WAS INVALID. You MUST output ONLY a JSON object.
 
 Format: {"r":[{"kanji":"hiragana",...},...]}
 
+CRITICAL: Each key MUST be the actual kanji word from the input, NOT "kanji" or "word"!
 Each value must be PURE HIRAGANA — no "=", no "()", no extra text.
 Use {} for lines with no kanji.
 
@@ -289,10 +291,53 @@ Output ONLY the JSON object. Nothing else."""
     @classmethod
     def _is_off_task_response(cls, text: str) -> bool:
         """Return ``True`` if *text* looks like translation/analysis, not JSON."""
-        # Quick check: if it starts with { or [ it's probably JSON
         stripped = text.strip()
+
+        # ── JSON-structured text can still be off-task ──────────────
+        # If it starts with { or [, try to parse it and check if the
+        # content looks like regurgitated input (empty keys, long
+        # sentence values, etc.) rather than actual readings.
         if stripped.startswith("{") or stripped.startswith("["):
-            return False
+            # Parse and inspect content quality
+            try:
+                data = _extract_json(stripped)
+                if isinstance(data, dict):
+                    raw = data.get("r") or data.get("results")
+                    if isinstance(raw, list) and len(raw) > 0:
+                        empty_key_items = 0
+                        long_value_items = 0
+                        placeholder_key_items = 0
+                        _PLACEHOLDER_KEYS = {"kanji", "word", "reading", "term", "text", "hiragana"}
+                        for item in raw:
+                            if isinstance(item, dict):
+                                all_empty = True
+                                has_long_value = False
+                                all_placeholder = True
+                                for k, v in item.items():
+                                    if isinstance(k, str) and k.strip():
+                                        all_empty = False
+                                        if k.strip().lower() not in _PLACEHOLDER_KEYS:
+                                            all_placeholder = False
+                                    if isinstance(v, str) and len(v) > 30:
+                                        has_long_value = True
+                                if all_empty and len(item) > 0:
+                                    empty_key_items += 1
+                                if has_long_value:
+                                    long_value_items += 1
+                                if all_placeholder and len(item) > 0:
+                                    placeholder_key_items += 1
+                        # If most items have empty keys → regurgitated input
+                        if empty_key_items > len(raw) * 0.3:
+                            return True
+                        # If most values are very long sentences → off-task
+                        if long_value_items > len(raw) * 0.5:
+                            return True
+                        # If most items use placeholder keys ("kanji"/"word")
+                        if placeholder_key_items > len(raw) * 0.3:
+                            return True
+                return False  # JSON looks valid, not off-task
+            except Exception:
+                pass  # fall through to text-based detection
 
         # Check for markdown code fences with JSON inside
         if stripped.startswith("```"):
@@ -343,6 +388,10 @@ Output ONLY the JSON object. Nothing else."""
 
         # Pad or truncate to match item_count
         result: list[dict[str, str]] = []
+        empty_key_count = 0   # items where ALL keys are empty strings
+        useless_item_count = 0  # items that had raw entries but all were filtered out
+        placeholder_key_count = 0  # items using literal "kanji"/"word" as key (LLM confused)
+        _PLACEHOLDER_KEYS = {"kanji", "word", "reading", "term", "text", "hiragana"}
         for i in range(item_count):
             if i < len(raw):
                 item = raw[i]
@@ -351,15 +400,53 @@ Output ONLY the JSON object. Nothing else."""
                     continue
                 # Collect raw entries, then sanitize
                 raw_dict: dict[str, str] = {}
+                had_empty_keys = False
+                had_raw_entries = False
+                all_keys_placeholder = True
                 for k, v in item.items():
                     if isinstance(k, str) and isinstance(v, str):
                         raw_dict[k] = v
+                        had_raw_entries = True
+                        if k.strip() == "":
+                            had_empty_keys = True
+                        if k.strip().lower() not in _PLACEHOLDER_KEYS:
+                            all_keys_placeholder = False
                     elif isinstance(k, str) and not isinstance(v, str):
                         raw_dict[k] = str(v)
+                        had_raw_entries = True
+                        if k.strip() == "":
+                            had_empty_keys = True
+                        if k.strip().lower() not in _PLACEHOLDER_KEYS:
+                            all_keys_placeholder = False
                 # Apply full sanitization pipeline
-                result.append(_sanitize_readings_dict(raw_dict))
+                sanitized = _sanitize_readings_dict(raw_dict)
+                result.append(sanitized)
+                # Track items that had content but became empty after sanitization
+                if had_raw_entries and not sanitized:
+                    useless_item_count += 1
+                # Track items where ALL non-empty keys were absent
+                if had_empty_keys and not sanitized:
+                    empty_key_count += 1
+                # Track items using placeholder keys (LLM confused about format)
+                if had_raw_entries and all_keys_placeholder and not sanitized:
+                    placeholder_key_count += 1
             else:
                 result.append({})
+
+        # ── Quality gate: reject responses that are structurally valid
+        #     but semantically empty (LLM outputting empty keys, regurgitated
+        #     sentences, etc.) ──────────────────────────────────────────
+        total_raw_items = min(len(raw), item_count)
+        if total_raw_items > 0:
+            # If > 30% of items have empty keys OR > 50% of items are
+            # useless (had content but all filtered), treat as invalid
+            if empty_key_count > total_raw_items * 0.3:
+                return None
+            if useless_item_count > total_raw_items * 0.5:
+                return None
+            # If > 30% use placeholder keys ("kanji" instead of actual word)
+            if placeholder_key_count > total_raw_items * 0.3:
+                return None
 
         return result
 
@@ -856,16 +943,19 @@ Output ONLY the JSON object. Nothing else."""
         input_lines = [f"[{i + 1}] {s}" for i, s in enumerate(items)]
         user_prompt = "\n".join(input_lines)
 
-        # Try primary prompt first, then escalate to retry prompt
+        # Try primary prompt first, then escalate to retry prompt,
+        # then try without response_format enforcement (some models
+        # misbehave with json_object mode).
         prompts = [
-            (self._SYSTEM_PROMPT_BATCH, False),
-            (self._SYSTEM_PROMPT_BATCH_RETRY, True),
+            (self._SYSTEM_PROMPT_BATCH, False, True),       # primary + json_mode
+            (self._SYSTEM_PROMPT_BATCH_RETRY, True, True),  # escalated + json_mode
+            (self._SYSTEM_PROMPT_BATCH, False, False),      # primary, NO json_mode
         ]
 
         last_raw: str = ""
         last_error: str = ""
 
-        for prompt_idx, (system_prompt, is_retry) in enumerate(prompts):
+        for prompt_idx, (system_prompt, is_retry, use_json_mode) in enumerate(prompts):
             try:
                 content = self._call_with_concurrency_limit(
                     self._pool.llm_call,
@@ -873,7 +963,7 @@ Output ONLY the JSON object. Nothing else."""
                     user_prompt=user_prompt,
                     model=self._model,
                     temperature=0.0,           # deterministic output
-                    response_format=self._RESPONSE_FORMAT,
+                    response_format=self._RESPONSE_FORMAT if use_json_mode else None,
                 )
             except Exception as exc:
                 # API-level failure — don't retry with different prompt
@@ -899,18 +989,18 @@ Output ONLY the JSON object. Nothing else."""
                         f"LLM returned off-task JSON keys: "
                         f"{sorted(off_task_keys & set(data.keys()))}"
                     )
-                    if not is_retry:
+                    if not is_last_attempt:
                         self._log(
                             f"LLM returned off-task data, retrying "
                             f"with escalated prompt... ({last_error})",
                             "warning",
                         )
-                        continue  # try retry prompt
+                        continue  # try next prompt
                     else:
                         raw_preview = content[:300]
                         self._log(
-                            f"LLM returned off-task data even after "
-                            f"retry. Raw: {raw_preview!r}",
+                            f"LLM returned off-task data after all "
+                            f"attempts. Raw: {raw_preview!r}",
                             "error",
                         )
                         raise LLMAPIError(
@@ -922,15 +1012,27 @@ Output ONLY the JSON object. Nothing else."""
             if validated is not None:
                 # Success — build result dict
                 result: Dict[str, Dict[str, str]] = {}
+                non_empty_count = 0
                 for i, sentence in enumerate(items):
                     readings = validated[i]
                     if readings:
+                        non_empty_count += 1
                         result[sentence] = readings
                 if result:
-                    return result
+                    # Quality gate: at least 10% of items should have readings
+                    if non_empty_count >= len(items) * 0.1 or len(items) <= 5:
+                        return result
+                    # Too few useful readings — treat as failed validation
+                    self._log(
+                        f"Only {non_empty_count}/{len(items)} items got readings "
+                        f"(< 10%), treating as invalid",
+                        "warning",
+                    )
 
             # ── Validation failed ─────────────────────────────────
-            if not is_retry:
+            is_last_attempt = (prompt_idx == len(prompts) - 1)
+
+            if not is_retry and not is_last_attempt:
                 # Check if the raw text looks off-task
                 if self._is_off_task_response(content):
                     last_error = "LLM returned translation/analysis instead of JSON"
@@ -949,15 +1051,25 @@ Output ONLY the JSON object. Nothing else."""
                 )
                 continue  # try retry prompt
 
-            # Retry prompt also failed
+            # ── Failed on retry or last-resort attempt ────────────
             raw_preview = content[:300]
+            if is_retry:
+                # Escalated prompt also failed — try without json_mode
+                self._log(
+                    f"LLM returned invalid response even after retry. "
+                    f"Trying without JSON mode...",
+                    "warning",
+                )
+                continue  # try third attempt (no json_mode)
+
+            # All attempts exhausted
             self._log(
-                f"LLM returned invalid response even after retry. "
+                f"LLM returned invalid response after all attempts. "
                 f"Raw: {raw_preview!r}",
                 "error",
             )
             raise LLMAPIError(
-                f"LLM returned invalid response after retry "
+                f"LLM returned invalid response after all attempts "
                 f"(first 200 chars: {content[:200]!r})"
             )
 

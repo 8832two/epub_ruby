@@ -63,7 +63,7 @@ class EPUBHV:
         self,
         file_path: Path,
         use_llm: bool = False,
-        llm_model: str = "deepseek-v4-flash",
+        llm_model: str = "deepseek-chat",
         llm_api_key: Optional[str] = None,
         llm_base_url: str = "https://api.deepseek.com",
         llm_batch_size: int = 200,
