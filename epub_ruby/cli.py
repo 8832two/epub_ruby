@@ -102,6 +102,18 @@ def main() -> None:
         help="Max sentences per API call (default: 200). Larger = fewer API calls = less token waste.",
     )
 
+    # Max output tokens
+    llm_group.add_argument(
+        "--llm-max-tokens",
+        type=int,
+        default=384000,
+        help=(
+            "Max output tokens per API call (default: 384000). "
+            "Lower this if you see JSON truncation errors. "
+            "DeepSeek v4 flash ~32K, v4 ~64K actual max output."
+        ),
+    )
+
     # Concurrency limit
     llm_group.add_argument(
         "--max-concurrent",
@@ -132,6 +144,7 @@ def main() -> None:
         "use_llm": args.use_llm,
         "llm_batch_size": args.batch_size,
         "llm_max_concurrent": args.max_concurrent,
+        "llm_max_tokens": args.llm_max_tokens,
         "llm_pool": llm_pool,
     }
 

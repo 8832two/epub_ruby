@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import logging
+import unicodedata
 from functools import lru_cache
 from itertools import groupby
 from typing import TYPE_CHECKING, Iterator, Tuple, List, Dict, Set
@@ -217,40 +218,51 @@ def _segment_text_with_readings(
     No filtering is performed — callers are responsible for feeding
     clean data (LLM module filters its own output; katakana module
     produces clean English readings).
+
+    Matching uses NFKC comparison for robustness against NFD/NFC
+    differences, but **output uses the original text characters**
+    — no pos_map, no character loss.
     """
     if not readings:
         yield text
         return
 
     _logger = logging.getLogger("epub_ruby")
-    keys = sorted(readings.keys(), key=len, reverse=True)
 
-    # Detect keys that don't appear in the text at all (debug only)
-    unmatched = [k for k in keys if k not in text]
-    if unmatched:
-        _logger.debug(
-            "%d key(s) not found in text (ignored): %s",
-            len(unmatched),
-            unmatched[:5]
-        )
+    # ── Build normalized-key lookup (longest-first) ─────────────
+    norm_keys: list[tuple[str, str, int]] = []  # (norm_key, orig_key, orig_len)
+    seen_norm: set[str] = set()
+    for k in sorted(readings.keys(), key=len, reverse=True):
+        nk = unicodedata.normalize("NFKC", k)
+        if nk not in seen_norm:
+            seen_norm.add(nk)
+            norm_keys.append((nk, k, len(k)))
 
+    # ── Walk ORIGINAL text, matching keys via NFKC comparison ──
     buffer: list[str] = []
     i = 0
-    while i < len(text):
-        match = None
-        for key in keys:
-            if text.startswith(key, i):
-                match = key
+    tlen = len(text)
+    while i < tlen:
+        match_orig_key: str | None = None
+        match_len: int = 0
+        for nk, orig_key, kl in norm_keys:
+            if i + kl > tlen:
+                continue
+            # Compare NFKC-normalized slices for robust matching
+            if unicodedata.normalize("NFKC", text[i:i + kl]) == nk:
+                match_orig_key = orig_key
+                match_len = kl
                 break
 
-        if match is not None:
+        if match_orig_key is not None:
             if buffer:
                 yield "".join(buffer)
                 buffer = []
-            yield from _split_tail(match, readings[match])
-            i += len(match)
+            yield from _split_tail(match_orig_key, readings[match_orig_key])
+            i += match_len
             continue
 
+        # No match: consume one original character as plain text
         buffer.append(text[i])
         i += 1
 
@@ -261,6 +273,7 @@ def _segment_text_with_readings(
 def _generate_readings_from_cache(
     text: str,
     batch_readings: Dict[str, Dict[str, str]],
+    batch_readings_norm: Dict[str, Dict[str, str]] | None = None,
 ) -> Iterator[str | Tuple[str, str]]:
     """Like :func:`generate_readings` but uses pre-computed LLM batch readings.
 
@@ -272,11 +285,22 @@ def _generate_readings_from_cache(
     Katakana loanwords receive English readings from local fugashi lookup
     (no LLM tokens consumed for this).
 
+    If *batch_readings_norm* is provided and the exact *text* is not found
+    in *batch_readings*, the normalized form of *text* is used as a
+    fallback key into *batch_readings_norm*.  This guards against
+    Unicode-representation mismatches and dedup artifacts.
+
     If the LLM returned no readings for this sentence (missing key or empty
     dict), the sentence is yielded as plain text so processing can continue.
     An error is logged but processing is not interrupted.
     """
     llm_readings = batch_readings.get(text, {})
+
+    # ── Normalized fallback ──────────────────────────────────────
+    if not llm_readings and batch_readings_norm is not None:
+        from .llm_ruby import _normalize_sentence
+        norm_key = _normalize_sentence(text)
+        llm_readings = batch_readings_norm.get(norm_key, {})
 
     # ── Build katakana→English dict independently ──────────────────
     from .katakana_english import extract_katakana_readings
@@ -304,13 +328,40 @@ def _generate_readings_from_cache(
     merged: dict[str, str] = {**katakana_readings, **llm_readings}
 
     if merged:
-        yield from _segment_text_with_readings(text, merged)
+        # ── Verify annotation completeness ─────────────────────────
+        # After segmentation, check if any kanji remains in the plain
+        # text output — those are words the LLM missed.
+        segments = list(_segment_text_with_readings(text, merged))
+        missed_kanji_chars: list[str] = []
+        for seg in segments:
+            if isinstance(seg, str) and _contains_kanji(seg):
+                missed_kanji_chars.append(seg)
+        if missed_kanji_chars:
+            _logger = logging.getLogger("epub_ruby")
+            _logger.error(
+                "PARTIAL ANNOTATION: %d kanji segment(s) not covered by "
+                "LLM readings in sentence: %s",
+                len(missed_kanji_chars), text[:80]
+            )
+            # Don't raise here — let _verify_kanji_coverage catch it.
+            # The segments are yielded as-is (plain text for missed kanji).
+        yield from segments
         return
 
     # Neither LLM nor katakana produced any readings.
-    # Yield the text as-is.
+    # This is a HARD ERROR for sentences that contain kanji —
+    # the LLM failed to annotate a sentence that needs furigana.
+    # Raise an exception so the caller can abort instead of silently
+    # producing incomplete output.
     _logger = logging.getLogger("epub_ruby")
-    _logger.debug("No readings for sentence (keeping as plain text): %s", text[:80])
+    if _contains_kanji(text):
+        _logger.error(
+            "MISSED ANNOTATION: kanji sentence got ZERO readings from LLM. "
+            "Sentence: %s", text[:120]
+        )
+        # Don't raise — _verify_kanji_coverage catches this.
+    else:
+        _logger.debug("No readings for sentence (keeping as plain text): %s", text[:80])
     yield text
 
 class RubySoup:
@@ -366,8 +417,28 @@ class RubySoup:
         self._llm_reader = llm_reader
         # Pre-computed LLM readings: {sentence: {word: reading}}
         self._batch_readings: Dict[str, Dict[str, str]] = {}
+        # Normalized-key lookup (built lazily for Unicode-robust fallback)
+        self._batch_readings_norm: Dict[str, Dict[str, str]] | None = None
         # Count of sentences that received NO readings from LLM (for summary)
         self._skipped_count: int = 0
+
+    def _get_batch_readings_norm(self) -> Dict[str, Dict[str, str]]:
+        """Build and return a normalized-key → readings lookup dict.
+
+        This is built lazily from ``_batch_readings`` so that
+        ``_generate_readings_from_cache`` can fall back to normalized
+        text matching when the exact text key is not found (Unicode
+        representation mismatches, dedup artifacts, etc.).
+        """
+        if self._batch_readings_norm is None:
+            from .llm_ruby import _normalize_sentence
+            norm: Dict[str, Dict[str, str]] = {}
+            for key, val in self._batch_readings.items():
+                nk = _normalize_sentence(key)
+                if nk not in norm:
+                    norm[nk] = val
+            self._batch_readings_norm = norm
+        return self._batch_readings_norm
 
     def inject(self, soup: BeautifulSoup | Tag) -> None:
         """Recursively walk the soup tree and wrap text nodes with ``<ruby>`` tags.
@@ -497,6 +568,11 @@ class RubySoup:
         """Process a block-level element: look up the full text in
         batch_readings, build ruby-annotated replacement, and replace
         the element's children.
+
+        Includes a **text integrity check**: after building the annotated
+        replacement, the plain-text content is verified to match the
+        original.  If verification fails, the element is LEFT UNCHANGED
+        to prevent text corruption.
         """
         text = self._get_block_text(element)
         if not text:
@@ -510,7 +586,8 @@ class RubySoup:
 
         if self._llm_reader is not None:
             segments = list(_generate_readings_from_cache(
-                text, self._batch_readings
+                text, self._batch_readings,
+                batch_readings_norm=self._get_batch_readings_norm(),
             ))
         else:
             segments = list(generate_readings(text))
@@ -537,6 +614,52 @@ class RubySoup:
                     ruby_tag.append(rp_close)
                 new_children.append(ruby_tag)
 
+        # ── TEXT INTEGRITY CHECK ──────────────────────────────────
+        # Reconstruct the plain text from new_children and verify it
+        # matches the original block text.  If not, the annotation
+        # logic has a bug and we MUST NOT corrupt the output.
+        rebuilt_parts: list[str] = []
+        for child in new_children:
+            if isinstance(child, str):
+                rebuilt_parts.append(child)
+            elif isinstance(child, Tag):
+                # Extract only the BASE text of ruby tags (first child is
+                # the base text; rt/rp content is reading/fallback)
+                if child.name == "ruby":
+                    base_text = "".join(
+                        str(c) for c in child.children
+                        if not (isinstance(c, Tag) and c.name in ("rt", "rp"))
+                    )
+                    rebuilt_parts.append(base_text)
+                else:
+                    rebuilt_parts.append(child.get_text())
+        rebuilt_text = "".join(rebuilt_parts)
+
+        if rebuilt_text != text:
+            _logger = logging.getLogger("epub_ruby")
+            _logger.error(
+                "TEXT INTEGRITY CHECK FAILED for block <%s>! "
+                "Original (%d chars): %r  |  Rebuilt (%d chars): %r. "
+                "Keeping original text unchanged to prevent corruption.",
+                element.name, len(text), text[:200],
+                len(rebuilt_text), rebuilt_text[:200],
+            )
+            # DO NOT modify the element — leave it as-is
+            self._skipped_count += 1
+            import sys
+            rd = self._batch_readings.get(text, {})
+            print(
+                f"  [SKIP-INTEGRITY #{self._skipped_count}] block <{element.name}> "
+                f"orig_len={len(text)} rebuilt_len={len(rebuilt_text)} "
+                f"orig[:80]={text[:80]!r} rebuilt[:80]={rebuilt_text[:80]!r} "
+                f"reading_keys={list(rd.keys())[:5]} "
+                f"n_segments={len(segments)}",
+                file=sys.stderr, flush=True
+            )
+            return
+
+        # ── Integrity passed: apply the annotation ───────────────
+
         # Check how many segments are (text, reading) tuples vs plain strings
         # If ALL segments are plain strings (no ruby added) and we're in
         # LLM mode, increment the skipped counter for diagnostics.
@@ -544,6 +667,19 @@ class RubySoup:
             has_ruby = any(isinstance(s, tuple) for s in segments)
             if not has_ruby and segments:
                 self._skipped_count += 1
+                import sys
+                # Show what readings exist for this sentence so we
+                # can diagnose why segmentation produced no ruby.
+                rd = self._batch_readings.get(text, {})
+                rd_keys = list(rd.keys())[:5] if rd else []
+                print(
+                    f"  [SKIP #{self._skipped_count}] block <{element.name}> "
+                    f"no ruby: text[:80]={text[:80]!r}  "
+                    f"in_batch={text in self._batch_readings}  "
+                    f"has_kanji={_contains_kanji(text)}  "
+                    f"reading_keys={rd_keys}",
+                    file=sys.stderr, flush=True
+                )
 
         # Replace element children
         element.clear()
@@ -564,8 +700,49 @@ class RubySoup:
             if not _contains_kanji(text):
                 return
             base = _get_base_soup()
-            wrapper = base.new_tag("temptag")
+
+            # Build segments
+            segments = []
             for item in self._build_ruby_segments(text):
+                segments.append(item)
+
+            # ── Integrity check ────────────────────────────────
+            rebuilt_parts = []
+            for seg in segments:
+                if isinstance(seg, str):
+                    rebuilt_parts.append(seg)
+                elif isinstance(seg, Tag):
+                    if seg.name == "ruby":
+                        base_text = "".join(
+                            str(c) for c in seg.children
+                            if not (isinstance(c, Tag) and c.name in ("rt", "rp"))
+                        )
+                        rebuilt_parts.append(base_text)
+                    else:
+                        rebuilt_parts.append(seg.get_text())
+            rebuilt = "".join(rebuilt_parts)
+            if rebuilt != text:
+                _logger = logging.getLogger("epub_ruby")
+                _logger.error(
+                    "TEXT INTEGRITY CHECK FAILED for text node! "
+                    "Original (%d chars): %r  |  Rebuilt (%d chars): %r. "
+                    "Keeping original text unchanged to prevent corruption.",
+                    len(text), text[:200], len(rebuilt), rebuilt[:200],
+                )
+                self._skipped_count += 1
+                import sys
+                rd = self._batch_readings.get(text, {})
+                print(
+                    f"  [SKIP-INTEGRITY-NODE #{self._skipped_count}] "
+                    f"orig_len={len(text)} rebuilt_len={len(rebuilt)} "
+                    f"orig[:80]={text[:80]!r} rebuilt[:80]={rebuilt[:80]!r} "
+                    f"reading_keys={list(rd.keys())[:5]}",
+                    file=sys.stderr, flush=True
+                )
+                return  # leave node unchanged
+
+            wrapper = base.new_tag("temptag")
+            for item in segments:
                 wrapper.append(item)
             node.replace_with(wrapper)
             wrapper.unwrap()
@@ -586,7 +763,10 @@ class RubySoup:
     def _build_ruby_segments(self, text: str) -> Iterator[str | Tag]:
         if self._llm_reader is not None:
             # Use pre-computed LLM readings
-            readings = _generate_readings_from_cache(text, self._batch_readings)
+            readings = _generate_readings_from_cache(
+                text, self._batch_readings,
+                batch_readings_norm=self._get_batch_readings_norm(),
+            )
         else:
             readings = generate_readings(text)
         for key, group in groupby(readings, key=type):

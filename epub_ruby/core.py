@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+import unicodedata
 import zipfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -63,12 +64,13 @@ class EPUBHV:
         self,
         file_path: Path,
         use_llm: bool = False,
-        llm_model: str = "deepseek-chat",
+        llm_model: str = "deepseek-v4-flash",
         llm_api_key: Optional[str] = None,
         llm_base_url: str = "https://api.deepseek.com",
         llm_batch_size: int = 200,
         llm_pool=None,
         llm_max_concurrent: int = 0,
+        llm_max_tokens: int = 384000,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> None:
         # Validate input file
@@ -106,6 +108,7 @@ class EPUBHV:
         self._llm_batch_size = llm_batch_size
         self._llm_pool = llm_pool
         self._llm_max_concurrent = max(0, llm_max_concurrent)
+        self._llm_max_tokens = max(1, llm_max_tokens)
 
         # Progress callback: fn(current, total) called per content file
         self._progress_callback = progress_callback
@@ -168,6 +171,7 @@ class EPUBHV:
                     pool=self._llm_pool,
                     batch_size=self._llm_batch_size,
                     max_concurrent=self._llm_max_concurrent,
+                    max_tokens=self._llm_max_tokens,
                     progress_callback=self._progress_callback,
                 )
                 print(f"  [LLM] Using API pool ({llm_reader._pool.provider_count} provider(s))")
@@ -178,6 +182,7 @@ class EPUBHV:
                     base_url=self._llm_base_url,
                     batch_size=self._llm_batch_size,
                     max_concurrent=self._llm_max_concurrent,
+                    max_tokens=self._llm_max_tokens,
                     progress_callback=self._progress_callback,
                 )
                 print(f"  [LLM] Using {self._llm_model} for context-aware readings")
@@ -197,6 +202,7 @@ class EPUBHV:
 
             def _collect_one(html_file: Path) -> tuple[RubySoup, BeautifulSoup, Path]:
                 raw = html_file.read_text(encoding="utf-8", errors="ignore")
+                raw = unicodedata.normalize("NFC", raw)
                 soup = BeautifulSoup(raw, "html.parser",
                                      string_containers=string_containers)
                 ruby = RubySoup(is_ruby_rp=True, llm_reader=llm_reader)
@@ -234,6 +240,19 @@ class EPUBHV:
                         f"LLM batch API returned empty readings for all "
                         f"{len(all_items)} sentences"
                     )
+
+                # ── Defense-in-depth: warn about missed kanji ──────
+                # Catastrophic failures (>50% ZERO) are already raised
+                # by _verify_kanji_coverage.  Here we just warn about
+                # partial misses and continue — partial coverage is
+                # better than no output at all.
+                if llm_reader.had_missed_kanji:
+                    print(
+                        f"  [LLM] ⚠ Kanji coverage incomplete: "
+                        f"{len(llm_reader.missed_kanji_sentences)} sentence(s) "
+                        f"have missed or partial annotations. "
+                        f"Continuing with partial coverage."
+                    )
             else:
                 batch_readings = {}
                 total_chunks = 0
@@ -248,7 +267,10 @@ class EPUBHV:
                 if soup.body is not None:
                     ruby._batch_readings = batch_readings
                     ruby._apply(soup.body)
-                html_file.write_text(str(soup), encoding="utf-8")
+                # Write NFC-normalized output for consistent Unicode
+                html_file.write_text(
+                    unicodedata.normalize("NFC", str(soup)),
+                    encoding="utf-8")
                 print(f"  [{idx}/{total}] {html_file.name}")
                 return (idx, html_file.name, ruby._skipped_count)
 
@@ -273,6 +295,7 @@ class EPUBHV:
                 """Process a single file.  Returns (index, filename)."""
                 print(f"  [{idx}/{total}] {html_file.name}")
                 raw = html_file.read_text(encoding="utf-8", errors="ignore")
+                raw = unicodedata.normalize("NFC", raw)
                 soup = BeautifulSoup(raw, "html.parser",
                                      string_containers=string_containers)
                 if soup.body is not None:
@@ -309,8 +332,15 @@ class EPUBHV:
                 f"{stats['cache_hits']} cache hits"
             )
             if total_skipped > 0:
-                print(f"  [LLM] ⚠ {total_skipped} block(s) received no readings "
-                      f"from LLM (kept as plain text)")
+                from .exceptions import LLMBatchError
+                total_sentences = len(all_items) if all_items else 0
+                ratio = total_skipped / max(1, total_sentences)
+                raise LLMBatchError(
+                    f"{total_skipped}/{total_sentences} block(s) "
+                    f"({ratio:.1%}) received no ruby annotations. "
+                    f"Output would have unannotated kanji. "
+                    f"Check ~/.epub_ruby/epub_ruby.log for details."
+                )
             if stats["errors"]:
                 print(f"  [LLM] ⚠ {stats['errors']} batch(es) failed, "
                       f"{stats['total_failed']} sentences skipped – "
@@ -330,6 +360,14 @@ class EPUBHV:
                         f"only cached readings ({stats['total_annotated']} words) "
                         f"are available. Check your API configuration."
                     )
+
+            if llm_reader.had_missed_kanji:
+                print(
+                    f"  [LLM] ⚠ Kanji coverage incomplete: "
+                    f"{stats['missed_kanji']} sentence(s) have "
+                    f"missed or partial annotations. "
+                    f"Output will have partial furigana coverage."
+                )
 
             if stats["total_annotated"] == 0 and stats["api_calls"] > 0:
                 print(f"  [LLM] ⚠ WARNING: API called but ZERO words annotated! "

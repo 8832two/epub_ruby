@@ -23,11 +23,12 @@ class Config:
 
     # LLM settings
     use_llm: bool = False
-    llm_model: str = "deepseek-chat"
+    llm_model: str = "deepseek-v4-flash"
     llm_api_key: Optional[str] = None
     llm_base_url: str = "https://api.deepseek.com"
     llm_batch_size: int = 200
     llm_max_concurrent: int = 0
+    llm_max_tokens: int = 384000
 
     # Processing
     num_workers: int = 0  # 0 = auto
@@ -43,7 +44,7 @@ class Config:
         """Load configuration from environment variables."""
         return cls(
             use_llm=os.getenv("EPUB_RUBY_USE_LLM", "false").lower() == "true",
-            llm_model=os.getenv("EPUB_RUBY_LLM_MODEL", "deepseek-chat"),
+            llm_model=os.getenv("EPUB_RUBY_LLM_MODEL", "deepseek-v4-flash"),
             llm_api_key=os.getenv("DEEPSEEK_API_KEY"),
             llm_base_url=os.getenv(
                 "EPUB_RUBY_LLM_BASE_URL",
@@ -51,6 +52,7 @@ class Config:
             ),
             llm_batch_size=int(os.getenv("EPUB_RUBY_BATCH_SIZE", "200")),
             llm_max_concurrent=int(os.getenv("EPUB_RUBY_MAX_CONCURRENT", "0")),
+            llm_max_tokens=int(os.getenv("EPUB_RUBY_MAX_TOKENS", "384000")),
             output_dir=Path(os.getenv("EPUB_RUBY_OUTPUT_DIR")) if
             os.getenv("EPUB_RUBY_OUTPUT_DIR") else None,
             gui_theme=os.getenv("EPUB_RUBY_GUI_THEME", "light"),
@@ -90,11 +92,12 @@ class Config:
 
         return cls(
             use_llm=llm_cfg.get("use_llm", False),
-            llm_model=llm_cfg.get("model", "deepseek-chat"),
+            llm_model=llm_cfg.get("model", "deepseek-v4-flash"),
             llm_api_key=llm_cfg.get("api_key"),
             llm_base_url=llm_cfg.get("base_url", "https://api.deepseek.com"),
             llm_batch_size=llm_cfg.get("batch_size", 200),
             llm_max_concurrent=llm_cfg.get("max_concurrent", 0),
+            llm_max_tokens=llm_cfg.get("max_tokens", 384000),
             num_workers=proc_cfg.get("num_workers", 0),
             output_dir=Path(proc_cfg.get("output_dir"))
             if proc_cfg.get("output_dir") else None,

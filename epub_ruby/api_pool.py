@@ -199,6 +199,18 @@ class APIQuotaExhaustedError(Exception):
     """Raised internally when a provider's quota is exhausted."""
 
 
+class APITruncatedError(Exception):
+    """Raised when the LLM response was truncated (finish_reason='length').
+
+    Carries the partial content so callers can decide whether to split
+    the batch and retry with smaller chunks.
+    """
+
+    def __init__(self, *args: Any, partial_content: str = "") -> None:
+        super().__init__(*args)
+        self.partial_content = partial_content
+
+
 class APIPoolExhaustedError(Exception):
     """Raised when ALL providers in the pool have been exhausted.
 
@@ -347,6 +359,7 @@ class APIPool:
         model: str = "",
         temperature: float = 0.1,
         response_format: Optional[Dict[str, Any]] = None,
+        max_tokens: int = 16384,
     ) -> str:
         """Unified LLM call – works across all providers.
 
@@ -357,6 +370,8 @@ class APIPool:
         Args:
             response_format: OpenAI-compatible response format dict
                 (e.g. ``{"type": "json_object"}``).  Ignored by Gemini.
+            max_tokens: Maximum tokens in the response (default 16384).
+                Set higher for large batch sizes to prevent truncation.
 
         Returns the text content.  Auto-fails over on quota errors.
         """
@@ -364,6 +379,7 @@ class APIPool:
             lambda cfg, client: self._do_llm_call(
                 cfg, client, system_prompt, user_prompt,
                 model or cfg.model, temperature, response_format,
+                max_tokens,
             )
         )
 
@@ -469,6 +485,10 @@ class APIPool:
                     self._stats.provider_calls[cfg.provider] = \
                         self._stats.provider_calls.get(cfg.provider, 0) + 1
                 return result
+            except APITruncatedError:
+                # Truncation is NOT a provider error — propagate it
+                # directly so the caller can split the batch and retry.
+                raise
             except APIQuotaExhaustedError:
                 self._log(f"[{cfg.provider}] Quota exhausted, switching...")
                 self._pause_provider(idx)
@@ -532,6 +552,7 @@ class APIPool:
         model: str,
         temperature: float,
         response_format: Optional[Dict[str, Any]] = None,
+        max_tokens: int = 16384,
     ) -> str:
         """Execute an LLM call, adapting to the provider type."""
         provider = Provider(cfg.provider)
@@ -551,6 +572,7 @@ class APIPool:
                 ],
                 model=model,
                 temperature=temperature,
+                max_tokens=max_tokens,
                 **kwargs,
             )
         elif provider == Provider.GEMINI:
@@ -575,7 +597,12 @@ class APIPool:
         temperature: float,
         **kwargs: Any,
     ) -> str:
-        """Execute OpenAI-compatible chat completion."""
+        """Execute OpenAI-compatible chat completion.
+
+        Raises:
+            APITruncatedError: When finish_reason indicates the output
+                was truncated (e.g. hit max_tokens limit).
+        """
         try:
             response = client.chat.completions.create(
                 model=model,
@@ -584,7 +611,24 @@ class APIPool:
                 stream=False,
                 **kwargs,
             )
-            return response.choices[0].message.content or ""
+            choice = response.choices[0]
+            content = choice.message.content or ""
+
+            # ── Detect truncation ──────────────────────────────────
+            # finish_reason == "length" means the model hit the output
+            # token limit.  The JSON is almost certainly incomplete.
+            finish = getattr(choice, "finish_reason", None)
+            if finish and finish != "stop":
+                # "length", "max_tokens", "content_filter", etc.
+                raise APITruncatedError(
+                    f"LLM output truncated (finish_reason={finish!r}, "
+                    f"max_tokens={kwargs.get('max_tokens', '?')})",
+                    partial_content=content,
+                )
+
+            return content
+        except APITruncatedError:
+            raise  # propagate, don't convert to quota error
         except Exception as exc:
             if _is_quota_error(exc):
                 raise APIQuotaExhaustedError(str(exc)) from exc
@@ -597,14 +641,32 @@ class APIPool:
         model: str,
         **kwargs: Any,
     ) -> str:
-        """Execute Gemini content generation."""
+        """Execute Gemini content generation.
+
+        Raises:
+            APITruncatedError: When finish_reason indicates truncation.
+        """
         try:
             response = client.models.generate_content(
                 model=model,
                 contents=contents,
                 **kwargs,
             )
-            return response.text or ""
+            content = response.text or ""
+
+            # ── Detect truncation ──────────────────────────────────
+            if response.candidates:
+                candidate = response.candidates[0]
+                finish = getattr(candidate, "finish_reason", None)
+                if finish and str(finish) not in ("STOP", "stop", "STOP_REASON_UNSPECIFIED"):
+                    raise APITruncatedError(
+                        f"Gemini output truncated (finish_reason={finish!r})",
+                        partial_content=content,
+                    )
+
+            return content
+        except APITruncatedError:
+            raise  # propagate
         except Exception as exc:
             if _is_quota_error(exc):
                 raise APIQuotaExhaustedError(str(exc)) from exc

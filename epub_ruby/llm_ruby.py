@@ -8,12 +8,13 @@ import sys
 import time
 import threading
 import traceback
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
 
-from .api_pool import APIPool, APIConfig, APIPoolExhaustedError
+from .api_pool import APIPool, APIConfig, APIPoolExhaustedError, APITruncatedError
 from .exceptions import LLMAPIError, LLMBatchError
 
 _logger = logging.getLogger("epub_ruby")
@@ -33,6 +34,103 @@ def _contains_kanji(text: str) -> bool:
         cp = ord(ch)
         if 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:
             return True
+    return False
+
+
+def _extract_kanji_words(text: str) -> list[str]:
+    """Extract all contiguous CJK-kanji runs from *text*.
+
+    For ``"私は毎日日本語を勉強します"`` returns
+    ``["私", "毎日", "日本語", "勉強"]``.
+
+    Used to detect **partial** annotation misses — when the LLM annotates
+    *some* kanji words in a sentence but silently skips others.
+    """
+    words: list[str] = []
+    current: list[str] = []
+    for ch in text:
+        cp = ord(ch)
+        if 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:
+            current.append(ch)
+        else:
+            if current:
+                words.append("".join(current))
+                current = []
+    if current:
+        words.append("".join(current))
+    return words
+
+
+def _is_kanji_covered(kanji_word: str, covered_keys: set[str]) -> bool:
+    """Check if *kanji_word* is covered by any LLM annotation key.
+
+    Uses **bidirectional** substring containment:
+
+    - ``kanji_word in key`` — LLM key includes okurigana
+      (e.g. ``"食" in "食べる"``, ``"話" in "話して"``)
+    - ``key in kanji_word`` — LLM split a compound into sub-words
+      (e.g. ``"去年" in "去年退学"``, ``"唯一" in "唯一普通"``)
+
+    Both *kanji_word* and keys are NFKC-normalized before comparison
+    to handle Unicode representation differences.
+    """
+    kw_norm = unicodedata.normalize("NFKC", kanji_word)
+    for key in covered_keys:
+        key_norm = unicodedata.normalize("NFKC", key)
+        if kw_norm in key_norm or key_norm in kw_norm:
+            return True
+    return False
+
+
+def _readings_match_sentence(sentence: str, readings: dict[str, str]) -> float:
+    """Return the fraction of *readings* keys that appear in *sentence*.
+
+    Used to detect **positional shift**: when the LLM returns items in
+    wrong order, the keys won't appear in the corresponding sentence.
+
+    Returns 1.0 if all keys are found, 0.0 if none are.
+    Empty *readings* returns 1.0 (no mismatch to detect).
+
+    Uses NFKC normalization so that different Unicode representation
+    forms of the same character (NFC vs NFD) still match.
+    """
+    if not readings:
+        return 1.0
+    sent_norm = unicodedata.normalize("NFKC", sentence)
+    matching = sum(1 for k in readings if unicodedata.normalize("NFKC", k) in sent_norm)
+    return matching / len(readings)
+
+
+def _kanji_sequence_in_text(key: str, text: str) -> bool:
+    """Check if the kanji characters in *key* appear in *text* in order.
+
+    Unlike simple substring matching, this handles okurigana conjugation
+    mismatches.  For example, the LLM may output ``"合わせる"`` (dictionary
+    form) but the sentence contains ``"合わせてる"`` (conjugated form).
+    Simple ``in`` check fails, but the kanji sequence ``["合"]`` still
+    matches ``"合わせてる"``.
+
+    Both *key* and *text* are NFKC-normalized before comparison.
+    """
+    key_norm = unicodedata.normalize("NFKC", key)
+    text_norm = unicodedata.normalize("NFKC", text)
+
+    # ── Fast path: exact substring match ──────────────────────────
+    if key_norm in text_norm:
+        return True
+
+    # ── Extract kanji from key ────────────────────────────────────
+    key_kanji = [ch for ch in key_norm if _contains_kanji(ch)]
+    if not key_kanji:
+        return False  # no kanji → use substring match only
+
+    # ── Check if kanji sequence appears in text in order ──────────
+    ki = 0
+    for ch in text_norm:
+        if ch == key_kanji[ki]:
+            ki += 1
+            if ki == len(key_kanji):
+                return True
     return False
 
 
@@ -180,11 +278,187 @@ def _extract_json(text: str) -> Dict[str, Any]:
         elif text[i] == "}":
             depth -= 1
             if depth == 0:
+                candidate = text[start : i + 1]
                 try:
-                    return json.loads(text[start : i + 1])  # type: ignore[no-any-return]
+                    return json.loads(candidate)  # type: ignore[no-any-return]
                 except json.JSONDecodeError:
+                    # ── Try to repair common truncation issues ──
+                    repaired = _repair_truncated_json(candidate)
+                    if repaired is not None:
+                        try:
+                            return json.loads(repaired)  # type: ignore[no-any-return]
+                        except json.JSONDecodeError:
+                            pass
                     return {}
     return {}
+
+
+def _repair_truncated_json(text: str) -> str | None:
+    """Try to fix a truncated JSON object string.
+
+    Handles common LLM output truncation:
+      - Unterminated string value: ``{"key":"val}`` → ``{"key":"val"}``
+      - Missing closing brace: ``{"key":"val"`` → ``{"key":"val"}``
+
+    Returns the repaired string, or ``None`` if repair is impossible.
+    """
+    if not text or not (text.startswith("{") and text.endswith("}")):
+        return None
+
+    inner = text[1:-1]  # content between { and }
+
+    # ── Count quotes to detect unterminated strings ─────────
+    # In valid JSON like {"k":"v"}, there are always an EVEN number
+    # of unescaped double-quotes.  An odd count means a string is
+    # unterminated.
+    quote_count = 0
+    escape = False
+    for ch in inner:
+        if escape:
+            escape = False
+            continue
+        if ch == '\\':
+            escape = True
+            continue
+        if ch == '"':
+            quote_count += 1
+
+    if quote_count % 2 != 0:
+        # Odd quotes → a string value is unterminated.
+        # Append a closing quote just before the final }.
+        return text[:-1] + '"' + text[-1]
+
+    # ── No closing brace at all ──────────────────────────
+    if not text.endswith("}"):
+        # Check if text looks like valid JSON except missing }
+        if quote_count % 2 == 0 and text.endswith('"'):
+            return text + "}"
+
+    return None
+
+
+def _salvage_partial_json(
+    content: str, expected_count: int
+) -> tuple[list[dict[str, str]] | None, int]:
+    """Extract as many complete array items as possible from truncated JSON.
+
+    When the LLM response is cut off mid-stream, the JSON is invalid as a
+    whole, but individual array items may be complete and parseable.
+    This function walks the ``"r"`` array character-by-character to find
+    complete ``{...}`` objects that can be salvaged.
+
+    Returns:
+        ``(salvaged_items, salvaged_count)`` where *salvaged_items* is
+        ``None`` if no items could be salvaged, otherwise a list of
+        ``{word: reading}`` dicts.  *salvaged_count* is always the number
+        of complete items found (0 if none).
+    """
+    if not content:
+        return None, 0
+    text = content.strip()
+
+    # Find the "r" array start: "r": [
+    import re as _re
+    match = _re.search(r'"r"\s*:\s*\[', text)
+    if not match:
+        return None, 0
+    pos = match.end()
+
+    items: list[dict[str, str]] = []
+    depth = 0
+    item_start = -1
+    in_string = False
+    escape = False
+    n = len(text)
+
+    while pos < n:
+        ch = text[pos]
+        if escape:
+            escape = False
+            pos += 1
+            continue
+        if ch == '\\':
+            escape = True
+            pos += 1
+            continue
+        if ch == '"':
+            in_string = not in_string
+            pos += 1
+            continue
+        if in_string:
+            pos += 1
+            continue
+
+        # Outside strings — track braces
+        if ch == '{':
+            if depth == 0:
+                item_start = pos
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and item_start >= 0:
+                # Complete item found
+                try:
+                    item = json.loads(text[item_start:pos + 1])
+                    if isinstance(item, dict):
+                        # Convert all values to str
+                        clean: dict[str, str] = {}
+                        for k, v in item.items():
+                            if isinstance(k, str) and k.strip():
+                                clean[k.strip()] = str(v) if isinstance(v, str) else str(v)
+                        if clean:
+                            items.append(clean)
+                        else:
+                            items.append({})
+                    else:
+                        items.append({})
+                except json.JSONDecodeError:
+                    items.append({})
+                item_start = -1
+        elif ch == ']' and depth == 0:
+            # Array closed naturally — we shouldn't reach here normally
+            break
+
+        pos += 1
+
+    salvaged = len(items)
+    if salvaged == 0:
+        return None, 0
+    return items, salvaged
+
+
+def _looks_truncated(content: str) -> bool:
+    """Heuristic: does *content* look like truncated/incomplete JSON?
+
+    Checks for:
+      - Unbalanced braces/brackets (more ``{`` than ``}``)
+      - Ends mid-string (trailing ``"`` without value completion)
+      - Ends with a comma or colon (incomplete JSON value)
+    """
+    if not content:
+        return False
+    stripped = content.strip()
+
+    # ── Unbalanced array brackets ─────────────────────────────
+    open_braces = stripped.count("{")
+    close_braces = stripped.count("}")
+    open_brackets = stripped.count("[")
+    close_brackets = stripped.count("]")
+    if open_braces != close_braces:
+        return True
+    if open_brackets != close_brackets:
+        return True
+
+    # ── Ends mid-value ────────────────────────────────────────
+    last_non_ws = stripped.rstrip()[-1:] if stripped.rstrip() else ""
+    if last_non_ws in (",", ":", '"'):
+        return True
+
+    # ── Abrupt end: content doesn't end with ] or } ───────────
+    if last_non_ws not in ("}", "]", '"'):
+        return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -222,23 +496,15 @@ class LLMRubyReader:
     _SYSTEM_PROMPT_BATCH = """\
 You are a kanji→hiragana converter. Output ONLY a JSON object.
 
-For each numbered input line, find ALL kanji words and return their hiragana reading.
+Below are numbered Japanese sentences. Find EVERY kanji word in EVERY sentence and give its hiragana reading. Do NOT skip any kanji word.
 
-CRITICAL FORMAT RULES:
-- Output ONLY: {"r":[{...},{...},...]}
-- One {...} object per input line, in the SAME order
-- Each key is a kanji word EXACTLY as it appears in the input — do NOT use "kanji" or "word" as the key!
-- Each value is PURE HIRAGANA only — no "=", no "()", no spaces, no notes
-- Use {} for lines with no kanji
-
-READING VALUE FORMAT:
-  "kanji":"hiragana_only"
-  ✓ "勉強":"べんきょう", "走った":"はしった", "周囲":"しゅうい"
-  ✗ "勉強":"べんきょう=study", "走":"はしった (ran)", "周囲":"しゅういに=に"
-  ✗ {"kanji":"はしった"} — NEVER use "kanji" as the key! Use the actual word!
+Output format: {"r":[{...},{...},...]}
+- The array contains kanji→hiragana dicts
+- Each key is a kanji word copied EXACTLY from the input (NOT "kanji"/"word")
+- Each value is PURE HIRAGANA only: no "=", "()", spaces, notes
+- Put ALL readings into one dict, or spread across several — either is fine
 
 EXAMPLES:
-
 Input:
 [1] 私は毎日日本語を勉強します
 [2] こんにちは
@@ -256,11 +522,20 @@ Output ONLY the JSON. No other text."""
     _SYSTEM_PROMPT_BATCH_RETRY = """\
 PREVIOUS OUTPUT WAS INVALID. You MUST output ONLY a JSON object.
 
-Format: {"r":[{"kanji":"hiragana",...},...]}
+Format: {"r":[{"actual_kanji":"hiragana",...},{...},...]}
 
-CRITICAL: Each key MUST be the actual kanji word from the input, NOT "kanji" or "word"!
-Each value must be PURE HIRAGANA — no "=", no "()", no extra text.
-Use {} for lines with no kanji.
+CRITICAL:
+- Each key MUST be the actual kanji word copied from the input — NOT "kanji"/"word"
+- Each value MUST be PURE HIRAGANA only — no "=", "()", spaces
+- Find EVERY kanji word in EVERY input line — do NOT skip any
+- Put all readings in one dict or spread across several — either is fine
+
+CORRECT:
+Input:
+[1] 私は毎日日本語を勉強します
+[2] こんにちは
+Output:
+{"r":[{"私":"わたし","毎日":"まいにち","日本語":"にほんご","勉強":"べんきょう"},{}]}
 
 Output ONLY the JSON object. Nothing else."""
 
@@ -307,7 +582,7 @@ Output ONLY the JSON object. Nothing else."""
                         empty_key_items = 0
                         long_value_items = 0
                         placeholder_key_items = 0
-                        _PLACEHOLDER_KEYS = {"kanji", "word", "reading", "term", "text", "hiragana"}
+                        _PLACEHOLDER_KEYS = {"kanji", "word", "reading", "term", "text", "hiragana", "i", "#"}
                         for item in raw:
                             if isinstance(item, dict):
                                 all_empty = True
@@ -363,6 +638,9 @@ Output ONLY the JSON object. Nothing else."""
     @staticmethod
     def _validate_batch_response(
         data: Any, item_count: int,
+        item_has_kanji: list[bool] | None = None,
+        missed_kanji_indices: list[int] | None = None,
+        skip_quality_gates: bool = False,
     ) -> list[dict[str, str]] | None:
         """Validate AND sanitize the parsed JSON response structure.
 
@@ -370,8 +648,18 @@ Output ONLY the JSON object. Nothing else."""
         with only valid, clean readings — or ``None`` if the structure is
         fundamentally invalid.
 
+        If *item_has_kanji* and *missed_kanji_indices* are provided, indices
+        of kanji-containing items that received ZERO annotations are appended
+        to *missed_kanji_indices*.
+
+        If *skip_quality_gates* is True (used for salvaged/truncated data),
+        the aggregate quality thresholds are skipped — individual items are
+        still sanitized but the batch is never rejected for having too many
+        empty items.
+
         Each per-line dict is run through :func:`_sanitize_readings_dict`
         to strip:
+          - The "i" / "#" metadata keys (sentence index markers)
           - "=" and trailing garbage (e.g. "しゅうい=に" → "しゅうい")
           - Parenthetical notes (e.g. "わたし (I)" → "わたし")
           - Pure-kana keys (nothing to annotate)
@@ -386,12 +674,30 @@ Output ONLY the JSON object. Nothing else."""
         if not isinstance(raw, list):
             return None
 
+        # ── Extract "i" values BEFORE sanitization (for position mapping) ──
+        # The "i" key is stripped by _sanitize_readings_dict (not kanji),
+        # but we need it preserved for the caller to do position remapping.
+        # We store it in a separate list and strip it explicitly here.
+        raw_positions: list[int | None] = []  # None = no "i" key
+        for item in raw:
+            if isinstance(item, dict):
+                i_val = item.get("i")
+                if i_val is not None:
+                    try:
+                        raw_positions.append(int(i_val) - 1)  # 0-based
+                    except (ValueError, TypeError):
+                        raw_positions.append(None)
+                else:
+                    raw_positions.append(None)
+            else:
+                raw_positions.append(None)
+
         # Pad or truncate to match item_count
         result: list[dict[str, str]] = []
         empty_key_count = 0   # items where ALL keys are empty strings
         useless_item_count = 0  # items that had raw entries but all were filtered out
         placeholder_key_count = 0  # items using literal "kanji"/"word" as key (LLM confused)
-        _PLACEHOLDER_KEYS = {"kanji", "word", "reading", "term", "text", "hiragana"}
+        _PLACEHOLDER_KEYS = {"kanji", "word", "reading", "term", "text", "hiragana", "i", "#"}
         for i in range(item_count):
             if i < len(raw):
                 item = raw[i]
@@ -433,20 +739,44 @@ Output ONLY the JSON object. Nothing else."""
             else:
                 result.append({})
 
+        # ── Kanji-aware missed-annotation detection ──────────────────
+        # If item_has_kanji is provided, track which kanji items got
+        # ZERO annotations (LLM returned {} or all entries were filtered).
+        if item_has_kanji is not None and missed_kanji_indices is not None:
+            for i in range(min(item_count, len(item_has_kanji))):
+                if item_has_kanji[i] and not result[i]:
+                    missed_kanji_indices.append(i)
+
         # ── Quality gate: reject responses that are structurally valid
         #     but semantically empty (LLM outputting empty keys, regurgitated
         #     sentences, etc.) ──────────────────────────────────────────
-        total_raw_items = min(len(raw), item_count)
-        if total_raw_items > 0:
-            # If > 30% of items have empty keys OR > 50% of items are
-            # useless (had content but all filtered), treat as invalid
-            if empty_key_count > total_raw_items * 0.3:
-                return None
-            if useless_item_count > total_raw_items * 0.5:
-                return None
-            # If > 30% use placeholder keys ("kanji" instead of actual word)
-            if placeholder_key_count > total_raw_items * 0.3:
-                return None
+        # Skip when salvaging truncated data — we expect trailing empties.
+        if not skip_quality_gates:
+            total_raw_items = min(len(raw), item_count)
+            if total_raw_items > 0:
+                # If > 20% of items have empty keys OR > 40% of items are
+                # useless (had content but all filtered), treat as invalid
+                if empty_key_count > total_raw_items * 0.2:
+                    return None
+                if useless_item_count > total_raw_items * 0.4:
+                    return None
+                # If > 20% use placeholder keys ("kanji" instead of actual word)
+                # — lowered from 30% because the retry prompt now has
+                #   concrete examples so placeholder keys indicate a
+                #   fundamental misunderstanding by the LLM.
+                if placeholder_key_count > total_raw_items * 0.2:
+                    return None
+                # If > 30% of kanji items got ZERO annotations, treat as invalid
+                # (lowered from 50% — 30% zero is already a serious problem)
+                if item_has_kanji is not None and missed_kanji_indices is not None:
+                    kanji_total = sum(1 for b in item_has_kanji[:item_count] if b)
+                    if kanji_total > 0:
+                        kanji_missed = sum(
+                            1 for idx in missed_kanji_indices
+                            if idx < item_count and idx < len(item_has_kanji) and item_has_kanji[idx]
+                        )
+                        if kanji_missed > kanji_total * 0.3:
+                            return None
 
         return result
 
@@ -463,8 +793,9 @@ Output ONLY the JSON object. Nothing else."""
         cache_size: int = 16384,
         rate_limit_delay: float = 0.1,
         timeout: float = 120.0,
-        max_retries: int = 3,
+        max_retries: int = 2,
         max_concurrent: int = 0,
+        max_tokens: int = 384000,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> None:
         """Create a new LLM-based ruby reader.
@@ -482,6 +813,8 @@ Output ONLY the JSON object. Nothing else."""
             timeout: HTTP request timeout in seconds.
             max_retries: Max retries per failed API call.
             max_concurrent: Max simultaneous API calls (0=unlimited).
+            max_tokens: Max output tokens per API call (default 16384).
+                Increase for large batch sizes to prevent truncation.
             progress_callback: Optional fn(completed, total) per chunk.
         """
         if pool is not None:
@@ -508,6 +841,7 @@ Output ONLY the JSON object. Nothing else."""
         self._rate_limit_delay = rate_limit_delay
         self._last_call_time = 0.0
         self._max_retries = max_retries
+        self._max_tokens = max_tokens
         self._lock = threading.Lock()
         self._progress_callback = progress_callback
 
@@ -533,6 +867,8 @@ Output ONLY the JSON object. Nothing else."""
         self.total_annotated = 0
         self.total_failed = 0
         self._any_batch_ok = False  # True when at least one API batch succeeds
+        self.missed_kanji_sentences: List[str] = []  # kanji sentences that got {} from LLM
+        self._had_missed_kanji = False  # True if ANY kanji sentence got no annotations
 
     # ── Disk cache ────────────────────────────────────────────────────
 
@@ -542,6 +878,10 @@ Output ONLY the JSON object. Nothing else."""
         Old cache may contain corrupted readings (e.g. "=なんだよ" suffixes)
         from previous prompt versions.  These are cleaned on load so they
         don't poison new runs.
+
+        Also runs a lightweight integrity check: if >5% of sampled entries
+        have keys that don't appear in their sentences (positional-shift
+        corruption), the entire cache is discarded.
         """
         try:
             if _CACHE_FILE.exists():
@@ -559,6 +899,43 @@ Output ONLY the JSON object. Nothing else."""
                             sanitized[sentence] = clean
                         if len(clean) != len(readings):
                             cleaned_count += 1
+
+                # ── Integrity check: sample entries for key-sentence mismatch ──
+                corrupt = 0
+                partial_corrupt = 0  # entries with partial kanji coverage
+                sample_size = min(200, len(sanitized))
+                sample_items = list(sanitized.items())[:sample_size]
+                for sentence, readings in sample_items:
+                    if readings and _readings_match_sentence(sentence, readings) == 0.0:
+                        corrupt += 1
+                    # Also detect partial kanji coverage (LLM missed some words)
+                    if readings and _contains_kanji(sentence):
+                        kanji_words = _extract_kanji_words(sentence)
+                        covered = set(readings.keys())
+                        missed = [w for w in kanji_words if not _is_kanji_covered(w, covered)]
+                        if missed and len(missed) >= len(kanji_words) * 0.3:
+                            partial_corrupt += 1
+                if corrupt > sample_size * 0.05:
+                    self._log(
+                        f"Disk cache appears corrupt "
+                        f"({corrupt}/{sample_size} sampled entries have "
+                        f"keys not in sentence). Discarding cache.",
+                        "error",
+                    )
+                    self._disk_cache = {}
+                    self._disk_dirty = True
+                    return
+                if partial_corrupt > sample_size * 0.10:
+                    self._log(
+                        f"Disk cache has too many entries with partial kanji "
+                        f"coverage ({partial_corrupt}/{sample_size} sampled). "
+                        f"Discarding cache to force clean re-annotation.",
+                        "error",
+                    )
+                    self._disk_cache = {}
+                    self._disk_dirty = True
+                    return
+
                 self._disk_cache = sanitized
                 if cleaned_count > 0:
                     self._disk_dirty = True  # re-save sanitized cache
@@ -677,6 +1054,8 @@ Output ONLY the JSON object. Nothing else."""
             if self.disk_cache_hits > 0:
                 self._log(f"All {len(seen)} sentences served from cache "
                           f"({self.disk_cache_hits} from disk)")
+            # ── Kanji coverage check even when all cached ──────────
+            self._verify_kanji_coverage(result, seen)
             return result
 
         # Build chunks
@@ -763,6 +1142,50 @@ Output ONLY the JSON object. Nothing else."""
                 f"All {len(uncached)} sentences returned empty from LLM"
             )
 
+        # ── Kanji coverage: first pass (non-strict) ────────────────
+        zero_missed, partial_missed = self._verify_kanji_coverage(
+            result, seen, strict=False
+        )
+
+        # ── Repair: retry missed words individually ───────────────
+        if zero_missed or partial_missed:
+            self._repair_missed_readings(zero_missed, partial_missed, result)
+            # Second pass: strict check after repair
+            self._verify_kanji_coverage(result, seen, strict=True)
+            # Repair succeeded — clear stale flags from first pass
+            with self._lock:
+                self._had_missed_kanji = False
+                self.missed_kanji_sentences.clear()
+
+        # ── Propagate readings to ALL items (including dedup-duplicates) ──
+        # The seen-dict dedup in get_readings_batch drops sentences that
+        # normalize to the same form.  Those duplicates never got result
+        # entries.  After batch processing, the normalized cache contains
+        # all the readings — we propagate them back to every item in the
+        # original list so _apply_block / _process_text_node find them.
+        missing_from_result = 0
+        for s in items:
+            if s not in result:
+                norm = _normalize_sentence(s)
+                cached = self._cache_get(norm)
+                if cached is not None:
+                    result[s] = cached
+                    missing_from_result += 1
+        if missing_from_result > 0:
+            self._log(
+                f"Propagated cache readings to {missing_from_result} "
+                f"dedup-duplicate item(s) not in original result"
+            )
+
+        # ── Final verification: check ALL original items, not just seen ──
+        # Build a temporary seen-like dict for the full items list
+        full_seen: Dict[str, str] = {}
+        for s in items:
+            norm = _normalize_sentence(s)
+            if norm not in full_seen:
+                full_seen[norm] = s
+        self._verify_kanji_coverage(result, full_seen, strict=True)
+
         return result
 
     def _process_batch(
@@ -778,10 +1201,22 @@ Output ONLY the JSON object. Nothing else."""
 
         llm_result = self._retry_with_backoff(chunk)
 
+        # _retry_with_backoff returns {} when it gracefully gave up on
+        # all sentences (tiny batch, all retries exhausted).  Raise an
+        # error so the caller does NOT cache these empty results — we
+        # want to retry them on the next run in case a different model
+        # or prompt can handle them.
         if not llm_result:
-            msg = f"Batch {chunk_num}/{total_chunks} – LLM returned empty"
-            self._log(msg, "error")
-            raise LLMAPIError(msg)
+            self._log(
+                f"Batch {chunk_num}/{total_chunks} – "
+                f"LLM could not annotate any of the {len(chunk)} sentence(s) "
+                f"after all retries",
+                "warning",
+            )
+            raise LLMAPIError(
+                f"Batch {chunk_num}/{total_chunks}: all {len(chunk)} "
+                f"sentence(s) could not be annotated by LLM"
+            )
 
         words_annotated = sum(len(c) for c in llm_result.values())
         self._log(
@@ -790,6 +1225,257 @@ Output ONLY the JSON object. Nothing else."""
         )
 
         return llm_result
+
+    def _verify_kanji_coverage(
+        self,
+        result: Dict[str, Dict[str, str]],
+        seen: Dict[str, str],
+        strict: bool = False,
+    ) -> tuple[list[str], list[tuple[str, list[str]]]]:
+        """Verify kanji words got annotations.
+
+        Returns ``(zero_missed, partial_missed)`` lists.
+
+        When *strict* is True, raises :exc:`LLMBatchError` if ANY kanji
+        sentence has ZERO annotations.  When False, only raises if >50%
+        are ZERO (catastrophic failure).
+        """
+        total = len(seen)
+        zero_missed: list[str] = []
+        partial_missed: list[tuple[str, list[str]]] = []
+        partial_word_count = 0
+
+        kanji_total = 0
+        for norm, original in seen.items():
+            if not _contains_kanji(norm):
+                continue
+            kanji_total += 1
+            readings = result.get(original, {})
+            if not readings:
+                zero_missed.append(original)
+            else:
+                kanji_words = _extract_kanji_words(original)
+                covered = set(readings.keys())
+                missed_words = [w for w in kanji_words if not _is_kanji_covered(w, covered)]
+                if missed_words:
+                    partial_missed.append((original, missed_words))
+                    partial_word_count += len(missed_words)
+
+        with self._lock:
+            for s in self.missed_kanji_sentences:
+                # Only count as missed if the sentence STILL has no
+                # readings in result (repair may have fixed it).
+                if s in result and result[s]:
+                    continue  # repaired — not missed anymore
+                already_zero = s in zero_missed
+                already_partial = any(s == pm[0] for pm in partial_missed)
+                if not already_zero and not already_partial:
+                    zero_missed.append(s)
+
+        total_missed = len(zero_missed) + len(partial_missed)
+        if total_missed > 0:
+            parts: list[str] = []
+            if zero_missed:
+                parts.append(f"{len(zero_missed)} ZERO")
+            if partial_missed:
+                parts.append(
+                    f"{len(partial_missed)} PARTIAL"
+                    f" ({partial_word_count} word(s) missed)"
+                )
+            detail = ", ".join(parts)
+
+            zero_ratio = len(zero_missed) / max(1, kanji_total)
+            threshold = 0.0 if strict else 0.5
+            if zero_ratio > threshold:
+                self._log(
+                    f"KANJI COVERAGE ERROR: {len(zero_missed)}/{kanji_total} "
+                    f"kanji-containing sentence(s) got ZERO annotations "
+                    f"({zero_ratio:.0%}). "
+                    f"First 3: {zero_missed[:3]!r}",
+                    "error",
+                )
+                with self._lock:
+                    self._had_missed_kanji = True
+                raise LLMBatchError(
+                    f"{len(zero_missed)}/{kanji_total} kanji-containing sentence(s) "
+                    f"got ZERO annotations ({zero_ratio:.0%}). "
+                    f"Check API key / model / quota."
+                )
+
+            # In strict mode, PARTIAL annotations are also fatal
+            if strict and partial_missed:
+                self._log(
+                    f"KANJI COVERAGE ERROR: {len(partial_missed)}/{kanji_total} "
+                    f"kanji-containing sentence(s) have PARTIAL annotations "
+                    f"({partial_word_count} word(s) missed). "
+                    f"First 3: {[pm[0][:80] for pm in partial_missed[:3]]!r}",
+                    "error",
+                )
+                with self._lock:
+                    self._had_missed_kanji = True
+                raise LLMBatchError(
+                    f"{len(partial_missed)}/{kanji_total} kanji-containing "
+                    f"sentence(s) have PARTIAL annotations "
+                    f"({partial_word_count} word(s) missed)."
+                )
+
+            self._log(
+                f"KANJI COVERAGE: {total_missed}/{total} "
+                f"sentence(s) with missed annotations ({detail}). "
+                f"First 3: {(zero_missed + [pm[0] for pm in partial_missed])[:3]!r}",
+                "warning",
+            )
+            with self._lock:
+                self._had_missed_kanji = True
+
+        return zero_missed, partial_missed
+
+    # ------------------------------------------------------------------
+    # Per-word repair – retry individual missed kanji words
+    # ------------------------------------------------------------------
+
+    _REPAIR_SYSTEM_PROMPT = """\
+You are a kanji→hiragana converter. Output ONLY a JSON object.
+
+For the sentence below, give the hiragana reading for the specified kanji words.
+
+CRITICAL:
+- Output ONLY: {"word1":"reading1","word2":"reading2",...}
+- Each key is the EXACT kanji word from the input
+- Each value is PURE HIRAGANA only — no "=", no "()", no spaces
+- The sentence provides context for disambiguating readings (e.g. 人→ひと vs にん)
+
+Output ONLY the JSON object. Nothing else."""
+
+    def _repair_missed_readings(
+        self,
+        zero_missed: list[str],
+        partial_missed: list[tuple[str, list[str]]],
+        result: dict[str, dict[str, str]],
+    ) -> int:
+        """Retry individual missed kanji words with sentence context.
+
+        For each missed sentence, sends the FULL sentence as context
+        plus a list of specific kanji words to annotate.  This gives
+        the LLM enough context to disambiguate readings while keeping
+        the prompt small and focused.
+
+        Returns the number of words successfully repaired.
+        """
+        repair_items: list[tuple[str, list[str]]] = []
+        for sentence in zero_missed:
+            words = _extract_kanji_words(sentence)
+            if words:
+                repair_items.append((sentence, words))
+        for sentence, missed_words in partial_missed:
+            if missed_words:
+                repair_items.append((sentence, missed_words))
+
+        if not repair_items:
+            return 0
+
+        total_words = sum(len(w) for _, w in repair_items)
+        self._log(
+            f"Repairing {len(repair_items)} sentence(s) "
+            f"({total_words} missed word(s)) with parallel targeted queries..."
+        )
+
+        # ── Execute all in parallel ─────────────────────────────
+        repaired_count = 0
+        # Build word lookup for logging
+        words_by_sentence = {s: list(dict.fromkeys(w)) for s, w in repair_items}
+        with ThreadPoolExecutor(max_workers=len(repair_items)) as executor:
+            futures = {
+                executor.submit(
+                    self._repair_one_sentence, sentence, words
+                ): sentence
+                for sentence, words in repair_items
+            }
+            for future in as_completed(futures):
+                sentence, sanitized, error = future.result()
+                if sanitized is not None:
+                    if sentence in result:
+                        result[sentence].update(sanitized)
+                    else:
+                        result[sentence] = sanitized
+                    repaired_count += len(sanitized)
+                    unique_words = words_by_sentence.get(sentence, [])
+                    self._log(
+                        f"  ↻ repaired {len(sanitized)}/{len(unique_words)} "
+                        f"word(s): {sentence[:60]}",
+                    )
+                    still_missed = [w for w in unique_words
+                                    if w not in sanitized
+                                    and not _is_kanji_covered(w, set(sanitized.keys()))]
+                    if still_missed:
+                        self._log(
+                            f"  ⚠ LLM still missed: {still_missed}",
+                            "warning",
+                        )
+                else:
+                    self._log(
+                        f"  ✗ repair failed: {sentence[:60]}... ({error})",
+                        "warning",
+                    )
+
+        self._log(
+            f"Repair complete: {repaired_count}/{total_words} word(s) fixed"
+        )
+        return repaired_count
+
+    def _repair_one_sentence(
+        self, sentence: str, words: list[str]
+    ) -> tuple[str, dict[str, str] | None, str | None]:
+        """Repair a single sentence via LLM. Thread-safe.
+
+        Returns (sentence, readings_dict_or_None, error_msg_or_None).
+
+        Retries ONCE with the same prompt when the LLM returns
+        unparseable/malformed content (transient API glitch,
+        truncated response, etc.).
+        """
+        unique_words = list(dict.fromkeys(words))
+        word_list = "、".join(unique_words)
+        user_prompt = (
+            f"Sentence: {sentence}\n"
+            f"Annotate these kanji words: {word_list}"
+        )
+
+        last_error: str | None = None
+        for attempt in range(2):
+            try:
+                content = self._pool.llm_call(
+                    system_prompt=self._REPAIR_SYSTEM_PROMPT,
+                    user_prompt=user_prompt,
+                    model=self._model,
+                    temperature=0.0,
+                    max_tokens=min(4096, self._max_tokens),
+                )
+                data = _extract_json(content)
+                if isinstance(data, dict):
+                    sanitized = _sanitize_readings_dict(
+                        {str(k): str(v) for k, v in data.items()
+                         if isinstance(k, str) and isinstance(v, str)}
+                    )
+                    if sanitized:
+                        return (sentence, sanitized, None)
+                    else:
+                        last_error = f"sanitized to empty: {content[:100]!r}"
+                        if attempt == 0:
+                            continue  # retry once with same prompt
+                        return (sentence, None, last_error)
+                else:
+                    last_error = f"parse failed (got {type(data).__name__}): {content[:100]!r}"
+                    if attempt == 0:
+                        continue  # retry once
+                    return (sentence, None, last_error)
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt == 0:
+                    continue  # retry once
+                return (sentence, None, last_error)
+
+        return (sentence, None, last_error or "unreachable")
 
     # ------------------------------------------------------------------
     # Internals
@@ -803,16 +1489,121 @@ Output ONLY the JSON object. Nothing else."""
         The pool handles provider-level failover internally.
         This method retries on transient errors.
 
-        When all providers are exhausted (quota/rate-limit), the retry
-        strategy adapts: single-provider pools fail immediately (retrying
-        won't help), while multi-provider pools wait for the earliest
-        provider to become available.
+        When the response is **truncated** (finish_reason=length) or the
+        batch consistently fails validation (empty objects, garbled JSON),
+        the batch is automatically split into smaller halves and retried
+        recursively.  This avoids the "stuck batch" problem where the LLM
+        repeatedly produces the same invalid output for a given batch size.
         """
         last_error: str | None = None
         recovery_waits = 0  # prevent infinite recovery loops
         for attempt in range(self._max_retries + 1):
             try:
-                return self._call_api_batch(items)
+                # Use escalated retry prompt on 2nd+ attempts
+                return self._call_api_batch(
+                    items, use_retry_prompt=(attempt > 0)
+                )
+            except APITruncatedError as exc:
+                # ── Truncation detected → split batch and recurse ──
+                # The LLM hit its output token limit mid-response.
+                # Retrying with the same batch would hit the same limit,
+                # so we split instead.
+                mid = len(items) // 2
+                if mid < 1 or len(items) <= 2:
+                    msg = (
+                        f"Output truncated even for tiny batch "
+                        f"({len(items)} sentence(s)). "
+                        f"Increase --llm-max-tokens (current: {self._max_tokens})"
+                    )
+                    self._log(msg, "error")
+                    with self._lock:
+                        self.errors.append(
+                            f"{datetime.now().isoformat()} | {msg}"
+                        )
+                    raise LLMAPIError(msg) from exc
+
+                self._log(
+                    f"Truncation detected → splitting "
+                    f"{len(items)} → {mid}+{len(items)-mid}",
+                    "warning",
+                )
+                with self._lock:
+                    self.retries += 1
+                left = self._retry_with_backoff(items[:mid])
+                right = self._retry_with_backoff(items[mid:])
+                return {**left, **right}
+
+            except LLMAPIError as exc:
+                # ── Batch validation failed → split immediately ──
+                # Retrying with the same batch size almost never helps
+                # when the LLM produces truncated JSON or empty objects.
+                # Splitting is far more effective.
+                mid = len(items) // 2
+                if mid >= 1 and len(items) > 2:
+                    self._log(
+                        f"Validation failed → splitting "
+                        f"{len(items)} → {mid}+{len(items)-mid} "
+                        f"(attempt {attempt + 1}/{self._max_retries + 1})",
+                        "warning",
+                    )
+                    with self._lock:
+                        self.retries += 1
+                    left = self._retry_with_backoff(items[:mid])
+                    right = self._retry_with_backoff(items[mid:])
+                    return {**left, **right}
+
+                # ── Tiny batch (≤2 items): retry with escalated prompt ──
+                # Don't give up immediately — try at least once more with
+                # the retry prompt before accepting defeat.
+                if len(items) <= 2 and attempt == 0:
+                    self._log(
+                        f"Tiny batch ({len(items)} item(s)) failed — "
+                        f"retrying with escalated prompt...",
+                        "warning",
+                    )
+                    with self._lock:
+                        self.retries += 1
+                    continue  # next iteration will use retry prompt
+
+                # ── Tiny batch (≤2 items) still failing after retry ──
+                # After repeated splits + retries we've reached the minimum
+                # size and the LLM still can't annotate these sentences.
+                # Accept defeat gracefully: return empty so the caller
+                # can move on, rather than aborting the entire EPUB.
+                if len(items) <= 2:
+                    self._log(
+                        f"Giving up on {len(items)} sentence(s) after "
+                        f"{attempt + 1} attempt(s) — LLM cannot annotate",
+                        "warning",
+                    )
+                    with self._lock:
+                        self.total_failed += len(items)
+                        self.retries += 1
+                    return {}  # empty = no readings for these items
+
+                # Batch too small to split — normal retry
+                last_error = f"{type(exc).__name__}: {exc}"
+                with self._lock:
+                    self.retries += 1
+                if attempt < self._max_retries:
+                    wait = 2 ** attempt
+                    self._log(
+                        f"Retry {attempt + 1}/{self._max_retries} in {wait}s "
+                        f"({last_error})",
+                        "warning"
+                    )
+                    time.sleep(wait)
+                else:
+                    # Retries exhausted on a small batch → give up gracefully
+                    self._log(
+                        f"Giving up on {len(items)} sentence(s) after "
+                        f"{self._max_retries} retries — LLM cannot annotate",
+                        "warning",
+                    )
+                    with self._lock:
+                        self.total_failed += len(items)
+                    return {}
+
             except APIPoolExhaustedError as exc:
                 # All providers are paused (quota/rate-limit exhausted)
                 # OR the pool is dead from a permanent error.
@@ -872,20 +1663,6 @@ Output ONLY the JSON object. Nothing else."""
                 raise LLMAPIError(msg) from exc
 
             except Exception as exc:
-                # ── Non-transient failures: off-task / invalid format ──
-                # _call_api_batch already tried both primary & escalated
-                # prompts internally.  If it still failed, retrying with
-                # backoff won't help — the LLM fundamentally won't comply.
-                err_msg = str(exc).lower()
-                if ("off-task" in err_msg or
-                        "non-json" in err_msg or
-                        "invalid response" in err_msg):
-                    self._log(
-                        f"LLM off-task error (not retryable): {exc}",
-                        "error",
-                    )
-                    raise
-
                 last_error = f"{type(exc).__name__}: {exc}"
                 with self._lock:
                     self.retries += 1
@@ -912,170 +1689,335 @@ Output ONLY the JSON object. Nothing else."""
     # ── Batch API call (JSON structured output) ────────────────────────
 
     # Response format for OpenAI-compatible APIs — forces JSON output
+    # Per DeepSeek official docs: {"type": "json_object"}
     _RESPONSE_FORMAT: dict[str, str] = {"type": "json_object"}
+
+    # DeepSeek v4 context window (per official docs)
+    _DEEPSEEK_CONTEXT_LIMIT: int = 1_000_000   # 1M tokens
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Conservative token estimation.
+
+        Japanese text: ~1.2–1.5 chars/token in most tokenizers.
+        We use 2 chars/token as a safe upper bound to never underestimate.
+        """
+        if not text:
+            return 0
+        # Conservative: 2 characters per token
+        return max(1, len(text) // 2) + 1
 
     def _call_api_batch(
         self, items: List[str],
+        use_retry_prompt: bool = False,
     ) -> Dict[str, Dict[str, str]]:
         """One LLM API call for MANY sentences.  Thread-safe.
 
         Uses **JSON structured output** with ``response_format``
-        enforcement.  The compact ``word=reading`` positional format has
-        been replaced because LLMs would ignore it and output translations
-        or literary analysis instead.
+        enforcement per DeepSeek official docs.
 
         Format:
             Input:  ``[N] sentence text`` (numbered lines, N starting at 1)
             Output: ``{"r": [{...}, {...}, ...]}`` (1:1 positional)
 
-        When the LLM goes off-task (translation, analysis, etc.), the
-        method retries with an escalated system prompt that explicitly
-        calls out the previous failure.
+        When the LLM returns invalid JSON or too few readings, raises
+        ``LLMAPIError`` so ``_retry_with_backoff`` can retry with the
+        same json_mode prompt (up to ``max_retries`` times).
+
+        **Overflow protection**: if the estimated total tokens
+        (prompt + max_tokens) exceed the 1M context window, the batch
+        is automatically split into smaller recursive calls.
+
+        Args:
+            use_retry_prompt: If True, use the escalated retry prompt
+                (``_SYSTEM_PROMPT_BATCH_RETRY``) which more forcefully
+                instructs the LLM to output valid JSON.
         """
+        if not items:
+            return {}
+
+        # Choose prompt based on whether this is a retry
+        system_prompt = (
+            self._SYSTEM_PROMPT_BATCH_RETRY if use_retry_prompt
+            else self._SYSTEM_PROMPT_BATCH
+        )
+
+        # ── Overflow check: split batch if estimated total exceeds context ──
+        input_lines = [f"[{i + 1}] {s}" for i, s in enumerate(items)]
+        user_prompt = "\n".join(input_lines)
+        prompt_estimate = self._estimate_tokens(
+            system_prompt + user_prompt
+        )
+
+        if prompt_estimate + self._max_tokens > self._DEEPSEEK_CONTEXT_LIMIT:
+            # Batch too large → split and recurse
+            mid = len(items) // 2
+            if mid == 0:
+                raise LLMAPIError(
+                    f"Single item too large for context window "
+                    f"(est. {prompt_estimate} prompt tokens "
+                    f"+ {self._max_tokens} max output > "
+                    f"{self._DEEPSEEK_CONTEXT_LIMIT} context)"
+                )
+            self._log(
+                f"Batch overflow detected (est. {prompt_estimate}"
+                f"+{self._max_tokens}"
+                f" > {self._DEEPSEEK_CONTEXT_LIMIT}), "
+                f"splitting {len(items)} → {mid}+{len(items)-mid}"
+            )
+            left = self._call_api_batch(items[:mid], use_retry_prompt=use_retry_prompt)
+            right = self._call_api_batch(items[mid:], use_retry_prompt=use_retry_prompt)
+            return {**left, **right}
+
         with self._lock:
             self._rate_limit()
             self.api_calls += 1
 
-        if not items:
-            return {}
+        # Single json_mode call — retries are handled by _retry_with_backoff
+        try:
+            content = self._call_with_concurrency_limit(
+                self._pool.llm_call,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=self._model,
+                temperature=0.0,
+                response_format=self._RESPONSE_FORMAT,
+                max_tokens=self._max_tokens,
+            )
+        except APITruncatedError:
+            # Propagate without wrapping — _retry_with_backoff will split
+            raise
+        except Exception as exc:
+            raise LLMAPIError(
+                f"LLM API call failed: {exc}"
+            ) from exc
 
-        # Build numbered input lines for clearer positional context
-        input_lines = [f"[{i + 1}] {s}" for i, s in enumerate(items)]
-        user_prompt = "\n".join(input_lines)
+        # ── Parse & extract ALL readings directly ─────────────────
+        # We bypass _validate_batch_response for the primary path
+        # because the LLM may output more items than sentences
+        # (e.g. alternating [{readings},{},{readings},{}...]).
+        # _validate_batch_response truncates to item_count, losing
+        # readings from items beyond that limit.
+        # Instead we directly sanitize ALL raw items into a flat dict.
+        data = _extract_json(content)
 
-        # Try primary prompt first, then escalate to retry prompt,
-        # then try without response_format enforcement (some models
-        # misbehave with json_object mode).
-        prompts = [
-            (self._SYSTEM_PROMPT_BATCH, False, True),       # primary + json_mode
-            (self._SYSTEM_PROMPT_BATCH_RETRY, True, True),  # escalated + json_mode
-            (self._SYSTEM_PROMPT_BATCH, False, False),      # primary, NO json_mode
-        ]
+        # Compute which items have kanji (for missed-annotation detection)
+        item_has_kanji = [_contains_kanji(s) for s in items]
 
-        last_raw: str = ""
-        last_error: str = ""
+        raw_list = data.get("r") or data.get("results") or []
+        all_readings: dict[str, str] = {}
+        if isinstance(raw_list, list):
+            for item in raw_list:
+                if isinstance(item, dict):
+                    # Build raw dict, converting all values to str
+                    raw_dict: dict[str, str] = {}
+                    for k, v in item.items():
+                        if isinstance(k, str) and k.strip():
+                            raw_dict[k.strip()] = str(v) if isinstance(v, str) else str(v)
+                    sanitized = _sanitize_readings_dict(raw_dict)
+                    for word, reading in sanitized.items():
+                        if word not in all_readings:
+                            all_readings[word] = reading
 
-        for prompt_idx, (system_prompt, is_retry, use_json_mode) in enumerate(prompts):
-            try:
-                content = self._call_with_concurrency_limit(
-                    self._pool.llm_call,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    model=self._model,
-                    temperature=0.0,           # deterministic output
-                    response_format=self._RESPONSE_FORMAT if use_json_mode else None,
+        if all_readings:
+            # ── Match readings to sentences ──────────────────────
+            result: Dict[str, Dict[str, str]] = {}
+            partial_missed_count = 0
+            partial_missed_words_total = 0
+            for i, sentence in enumerate(items):
+                sent_norm = unicodedata.normalize("NFKC", sentence)
+                sent_readings: dict[str, str] = {}
+                for word, reading in all_readings.items():
+                    # Use EXACT NFKC substring matching — must be
+                    # consistent with _segment_text_with_readings()
+                    # which uses text_norm.startswith(key, i).
+                    # Permissive kanji-sequence matching (the
+                    # fallback in _kanji_sequence_in_text) would
+                    # assign readings that cannot be applied later.
+                    word_norm = unicodedata.normalize("NFKC", word)
+                    if word_norm in sent_norm:
+                        sent_readings[word] = reading
+                if sent_readings:
+                    result[sentence] = sent_readings
+                    # ── Partial-miss detection ──────────────────
+                    if item_has_kanji[i]:
+                        kanji_words = _extract_kanji_words(sentence)
+                        covered = set(sent_readings.keys())
+                        missed_words = [w for w in kanji_words if not _is_kanji_covered(w, covered)]
+                        if missed_words:
+                            partial_missed_count += 1
+                            partial_missed_words_total += len(missed_words)
+                            with self._lock:
+                                if sentence not in self.missed_kanji_sentences:
+                                    self.missed_kanji_sentences.append(sentence)
+                                self._had_missed_kanji = True
+                elif item_has_kanji[i]:
+                    with self._lock:
+                        if sentence not in self.missed_kanji_sentences:
+                            self.missed_kanji_sentences.append(sentence)
+                        self._had_missed_kanji = True
+
+            if result:
+                # Log statistics
+                non_empty_count = len(result)
+                kanji_count = sum(1 for b in item_has_kanji if b)
+                # Compute batch_missed from actual ZERO sentences
+                batch_missed = sum(
+                    1 for i, b in enumerate(item_has_kanji)
+                    if b and items[i] not in result
                 )
-            except Exception as exc:
-                # API-level failure — don't retry with different prompt
-                raise LLMAPIError(
-                    f"LLM API call failed: {exc}"
-                ) from exc
-
-            last_raw = content
-
-            # ── Parse & validate ──────────────────────────────────
-            data = _extract_json(content)
-
-            # Check if the JSON data looks off-task
-            if isinstance(data, dict):
-                # Detect off-task keys like "analysis", "translation", etc.
-                off_task_keys = {
-                    "analysis", "translation", "summary", "commentary",
-                    "explanation", "continuation", "characters",
-                    "剧情", "分析", "翻译", "评论",
-                }
-                if off_task_keys & set(data.keys()):
-                    last_error = (
-                        f"LLM returned off-task JSON keys: "
-                        f"{sorted(off_task_keys & set(data.keys()))}"
+                # ── Reject if too few kanji sentences covered ─────
+                # Even if some sentences got readings, the batch may
+                # be too sparse to be useful.  Rejecting here causes
+                # _retry_with_backoff to split the batch into smaller
+                # pieces where the LLM can be more thorough.
+                if kanji_count > 0 and non_empty_count < kanji_count * 0.3:
+                    self._log(
+                        f"Batch result too sparse "
+                        f"({non_empty_count}/{kanji_count} kanji sentences, "
+                        f"< 30%) — rejecting so batch can be split",
+                        "warning",
                     )
-                    if not is_last_attempt:
+                    # Fall through to salvage/error path
+                else:
+                    if batch_missed > 0:
                         self._log(
-                            f"LLM returned off-task data, retrying "
-                            f"with escalated prompt... ({last_error})",
-                            "warning",
-                        )
-                        continue  # try next prompt
-                    else:
-                        raw_preview = content[:300]
-                        self._log(
-                            f"LLM returned off-task data after all "
-                            f"attempts. Raw: {raw_preview!r}",
+                            f"Batch has {batch_missed} kanji sentence(s) "
+                            f"with ZERO annotations (LLM missed them)",
                             "error",
                         )
-                        raise LLMAPIError(
-                            f"LLM returned off-task response: {last_error}"
+                    if partial_missed_count > 0:
+                        self._log(
+                            f"Batch has {partial_missed_count}/{kanji_count} "
+                            f"kanji items with PARTIAL annotations "
+                            f"({partial_missed_words_total} word(s) missed)",
+                            "error",
                         )
+                    return result
 
-            validated = self._validate_batch_response(data, len(items))
+            # result is empty — no sentences got readings at all
+            else:
+                self._log(
+                    f"Flattened dict had {len(all_readings)} readings but "
+                    f"none matched any sentence — treating as invalid",
+                    "warning",
+                )
 
-            if validated is not None:
-                # Success — build result dict
-                result: Dict[str, Dict[str, str]] = {}
-                non_empty_count = 0
+        # ── Primary validation failed — try to salvage partial results ──
+        # When the LLM output is truncated mid-array, many items may be
+        # complete and parseable.  We walk the raw JSON to extract those
+        # so they aren't wasted.
+        salvaged_items, salvaged_count = _salvage_partial_json(
+            content, len(items)
+        )
+        if salvaged_items is not None and salvaged_count > 0:
+            # Pad to full length, then validate
+            padded = list(salvaged_items)
+            while len(padded) < len(items):
+                padded.append({})
+            padded = padded[:len(items)]
+            missed_kanji_indices2: list[int] = []
+
+            validated2 = self._validate_batch_response(
+                {"r": padded}, len(items),
+                item_has_kanji=item_has_kanji,
+                missed_kanji_indices=missed_kanji_indices2,
+                skip_quality_gates=True,
+            )
+            if validated2 is not None:
+                # ── Same flat-dict + substring matching as primary ──
+                all_readings2: dict[str, str] = {}
+                for readings_dict in validated2:
+                    for word, reading in readings_dict.items():
+                        if word not in all_readings2:
+                            all_readings2[word] = reading
+
+                result2: Dict[str, Dict[str, str]] = {}
+                partial_missed2 = 0
+                partial_missed_words2 = 0
                 for i, sentence in enumerate(items):
-                    readings = validated[i]
-                    if readings:
-                        non_empty_count += 1
-                        result[sentence] = readings
-                if result:
-                    # Quality gate: at least 10% of items should have readings
-                    if non_empty_count >= len(items) * 0.1 or len(items) <= 5:
-                        return result
-                    # Too few useful readings — treat as failed validation
-                    self._log(
-                        f"Only {non_empty_count}/{len(items)} items got readings "
-                        f"(< 10%), treating as invalid",
-                        "warning",
+                    sent_norm = unicodedata.normalize("NFKC", sentence)
+                    sent_readings: dict[str, str] = {}
+                    for word, reading in all_readings2.items():
+                        # EXACT NFKC substring match (consistent with
+                        # _segment_text_with_readings)
+                        word_norm = unicodedata.normalize("NFKC", word)
+                        if word_norm in sent_norm:
+                            sent_readings[word] = reading
+                    if sent_readings:
+                        result2[sentence] = sent_readings
+                        if item_has_kanji[i]:
+                            kanji_words = _extract_kanji_words(sentence)
+                            covered = set(sent_readings.keys())
+                            missed_words = [w for w in kanji_words if not _is_kanji_covered(w, covered)]
+                            if missed_words:
+                                partial_missed2 += 1
+                                partial_missed_words2 += len(missed_words)
+                                with self._lock:
+                                    if sentence not in self.missed_kanji_sentences:
+                                        self.missed_kanji_sentences.append(sentence)
+                                    self._had_missed_kanji = True
+                    elif item_has_kanji[i]:
+                        with self._lock:
+                            if sentence not in self.missed_kanji_sentences:
+                                self.missed_kanji_sentences.append(sentence)
+                            self._had_missed_kanji = True
+
+                if result2:
+                    non_empty2 = len(result2)
+                    batch_missed2 = sum(
+                        1 for idx in missed_kanji_indices2
+                        if idx < len(item_has_kanji) and item_has_kanji[idx]
                     )
+                    kanji_count = sum(1 for b in item_has_kanji if b)
+                    # ── Reject salvage if too few kanji sentences covered ──
+                    # A salvage of 1/60 items covering only a few sentences
+                    # is worse than splitting and retrying with smaller batches.
+                    if kanji_count > 0 and non_empty2 < kanji_count * 0.5:
+                        self._log(
+                            f"Salvaged result too sparse "
+                            f"({non_empty2}/{kanji_count} kanji sentences, "
+                            f"< 50%) — rejecting so batch can be split",
+                            "warning",
+                        )
+                        # Fall through to error path → split/retry
+                    else:
+                        if batch_missed2 > 0:
+                            self._log(
+                                f"Salvaged response has {batch_missed2} kanji "
+                                f"sentence(s) with ZERO annotations",
+                                "error",
+                            )
+                        if partial_missed2 > 0:
+                            self._log(
+                                f"Salvaged response has {partial_missed2} kanji "
+                                f"sentence(s) with PARTIAL annotations "
+                                f"({partial_missed_words2} word(s) missed)",
+                                "error",
+                            )
+                        self._log(
+                            f"Salvaged {salvaged_count}/{len(items)} items "
+                            f"from truncated response "
+                            f"({non_empty2} valid after sanitization)",
+                            "warning",
+                        )
+                        return result2
 
-            # ── Validation failed ─────────────────────────────────
-            is_last_attempt = (prompt_idx == len(prompts) - 1)
-
-            if not is_retry and not is_last_attempt:
-                # Check if the raw text looks off-task
-                if self._is_off_task_response(content):
-                    last_error = "LLM returned translation/analysis instead of JSON"
-                    self._log(
-                        f"LLM went off-task ({last_error}), "
-                        f"retrying with escalated prompt...",
-                        "warning",
-                    )
-                    continue  # try retry prompt
-
-                # Not clearly off-task but still invalid JSON
-                last_error = f"LLM returned invalid/non-JSON response"
-                self._log(
-                    f"{last_error}, retrying with escalated prompt...",
-                    "warning",
-                )
-                continue  # try retry prompt
-
-            # ── Failed on retry or last-resort attempt ────────────
-            raw_preview = content[:300]
-            if is_retry:
-                # Escalated prompt also failed — try without json_mode
-                self._log(
-                    f"LLM returned invalid response even after retry. "
-                    f"Trying without JSON mode...",
-                    "warning",
-                )
-                continue  # try third attempt (no json_mode)
-
-            # All attempts exhausted
+        # ── Nothing salvageable — raise error for retry/split ──
+        raw_preview = content[:300]
+        if _looks_truncated(content):
             self._log(
-                f"LLM returned invalid response after all attempts. "
-                f"Raw: {raw_preview!r}",
-                "error",
+                f"LLM response appears TRUNCATED. Raw: {raw_preview!r}",
+                "warning",
             )
-            raise LLMAPIError(
-                f"LLM returned invalid response after all attempts "
-                f"(first 200 chars: {content[:200]!r})"
+        else:
+            self._log(
+                f"LLM returned invalid response. Raw: {raw_preview!r}",
+                "warning",
             )
-
-        # Should not reach here
         raise LLMAPIError(
-            f"LLM returned empty/invalid response after all retries"
+            f"LLM returned invalid response "
+            f"(first 200 chars: {content[:200]!r})"
         )
 
     def _call_with_concurrency_limit(self, fn, **kwargs: Any) -> str:
@@ -1111,9 +2053,15 @@ Output ONLY the JSON object. Nothing else."""
             "total_annotated": self.total_annotated,
             "total_failed": self.total_failed,
             "any_batch_ok": int(self._any_batch_ok),
+            "missed_kanji": len(self.missed_kanji_sentences),
         }
 
     @property
     def any_batch_succeeded(self) -> bool:
         """``True`` if at least one API batch succeeded this run."""
         return self._any_batch_ok
+
+    @property
+    def had_missed_kanji(self) -> bool:
+        """``True`` if any kanji-containing sentence got ZERO annotations from LLM."""
+        return self._had_missed_kanji

@@ -39,7 +39,7 @@ if errorlevel 1 (
 
 :: ── 安装项目依赖（确保完整） ────────────────────
 echo [信息] 安装项目依赖...
-pip install ".[gui,config]" --quiet
+pip install -e ".[gui,config]" --quiet
 if errorlevel 1 (
     echo [错误] 依赖安装失败
     pause

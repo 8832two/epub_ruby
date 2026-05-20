@@ -34,10 +34,8 @@ echo Virtual environment ready.
 call "%VENV_DIR%\Scripts\activate.bat"
 if errorlevel 1 goto ACTIVATE_FAIL
 
-:: -- 安装依赖 ---------------------------------------
-if exist "%VENV_DIR%\.deps_installed" goto RUN
-
-echo Installing dependencies (first run only) ...
+:: -- 安装/更新依赖（每次运行都刷新 editable install） --
+echo Checking dependencies ...
 echo.
 
 :: -- 检测国内镜像 (清华 TUNA) -----------------------
@@ -56,9 +54,8 @@ if not errorlevel 1 (
 echo.
 
 python -m pip install --upgrade pip --quiet %MIRROR%
-pip install -e ".[gui,config]" %MIRROR%
+pip install -e ".[gui,config]" --quiet %MIRROR%
 if errorlevel 1 goto INSTALL_FAIL
-echo installed > "%VENV_DIR%\.deps_installed"
 echo Done.
 
 :: -- 启动 GUI ---------------------------------------

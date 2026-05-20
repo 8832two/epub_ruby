@@ -41,7 +41,7 @@ info "安装 PyInstaller..."
 pip install pyinstaller --quiet
 
 info "安装项目依赖..."
-pip install ".[gui,config]" --quiet
+pip install -e ".[gui,config]" --quiet
 echo ""
 
 # ── 清理旧构建 ──────────────────────────────────

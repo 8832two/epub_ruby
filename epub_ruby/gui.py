@@ -344,7 +344,7 @@ def save_config(cfg):
 class APIEditDialog(QDialog):
     PROVIDERS = ["deepseek", "openai", "gemini"]
     MODEL_SUGGESTIONS = {
-        "deepseek": ["deepseek-chat", "deepseek-v4-flash", "deepseek-v4-pro"],
+        "deepseek": ["deepseek-v4-flash", "deepseek-v4-pro"],
         "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"],
         "gemini": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
     }
@@ -465,7 +465,8 @@ class ProcessWorker(QThread):
     llm_stats_signal = Signal(int, int)
 
     def __init__(self, input_path, output_dir, use_llm, api_configs,
-                 batch_size, max_concurrent, model="", api_key="", base_url=""):
+                 batch_size, max_concurrent, model="", api_key="", base_url="",
+                 max_tokens=16384):
         super().__init__()
         self._input_path = input_path
         self._output_dir = output_dir
@@ -476,11 +477,13 @@ class ProcessWorker(QThread):
         self._model = model
         self._api_key = api_key
         self._base_url = base_url
+        self._max_tokens = max_tokens
 
     def run(self):
         try:
             from epub_ruby.core import EPUBHV, list_all_epub_in_dir
             from epub_ruby.api_pool import APIPool, APIConfig
+            from epub_ruby.exceptions import LLMBatchError
 
             ip = Path(self._input_path)
             dest = Path(self._output_dir)
@@ -496,6 +499,7 @@ class ProcessWorker(QThread):
                 "use_llm": self._use_llm,
                 "llm_batch_size": self._batch_size,
                 "llm_max_concurrent": self._max_concurrent,
+                "llm_max_tokens": self._max_tokens,
             }
 
             if self._use_llm:
@@ -553,6 +557,9 @@ class ProcessWorker(QThread):
                     self.status_signal.emit(f"  ✓ {r.name}")
                     self.file_done_signal.emit(str(r))
                     _logger.info("OK: %s -> %s", f.name, r.name)
+                except LLMBatchError:
+                    # Kanji coverage failure — fatal, do not continue
+                    raise
                 except Exception as e:
                     self.status_signal.emit(f"  ✗ {e}")
                     _logger.error(
@@ -751,6 +758,23 @@ class MainWindow(QMainWindow):
         hint_lbl.setObjectName("hintLabel")
         cr.addWidget(hint_lbl)
         cr.addStretch(); pc.addLayout(cr)
+
+        # max_tokens row
+        tr = QHBoxLayout(); tr.setSpacing(8)
+        tr.addWidget(QLabel("最大Token:"))
+        self._max_tokens_slider = QSlider(Qt.Orientation.Horizontal)
+        self._max_tokens_slider.setRange(1024, 384000); self._max_tokens_slider.setValue(384000)
+        self._max_tokens_slider.setTickInterval(32768); self._max_tokens_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        tr.addWidget(self._max_tokens_slider, 1)
+        self._max_tokens_spin = QSpinBox(); self._max_tokens_spin.setRange(1024, 384000); self._max_tokens_spin.setValue(384000)
+        self._max_tokens_spin.setSingleStep(4096); self._max_tokens_spin.setFixedWidth(90)
+        self._max_tokens_slider.valueChanged.connect(self._max_tokens_spin.setValue)
+        self._max_tokens_spin.valueChanged.connect(self._max_tokens_slider.setValue)
+        tr.addWidget(self._max_tokens_spin)
+        mt_hint = QLabel("输出上限，批次大时调大防截断")
+        mt_hint.setObjectName("hintLabel")
+        tr.addWidget(mt_hint)
+        tr.addStretch(); pc.addLayout(tr)
         l.addWidget(param_card)
 
         # 单 API 快捷配置（无 API 池时使用）
@@ -762,7 +786,7 @@ class MainWindow(QMainWindow):
         fr = QHBoxLayout(); fr.setSpacing(6)
         fr.addWidget(QLabel("模型:"))
         self._default_model = QLineEdit()
-        self._default_model.setPlaceholderText("deepseek-chat")
+        self._default_model.setPlaceholderText("deepseek-v4-flash")
         self._default_model.setMaximumWidth(200)
         fr.addWidget(self._default_model)
         fr.addWidget(QLabel("Key:"))
@@ -990,6 +1014,7 @@ class MainWindow(QMainWindow):
             api_configs=self._api_configs if use_llm else [],
             batch_size=self._batch_spin.value(),
             max_concurrent=self._concurrent_spin.value(),
+            max_tokens=self._max_tokens_spin.value(),
             model=self._default_model.text().strip(),
             api_key=self._default_api_key.text().strip(),
             base_url="",
@@ -1026,6 +1051,7 @@ class MainWindow(QMainWindow):
         for name, w in [("_drop_zone", self._drop_zone), ("_output_input", self._output_input),
                          ("_batch_slider", self._batch_slider), ("_batch_spin", self._batch_spin),
                          ("_concurrent_slider", self._concurrent_slider), ("_concurrent_spin", self._concurrent_spin),
+                         ("_max_tokens_slider", self._max_tokens_slider), ("_max_tokens_spin", self._max_tokens_spin),
                          ("_default_model", self._default_model), ("_default_api_key", self._default_api_key),
                          ("_run_btn_normal", self._run_btn_normal), ("_run_btn_llm", self._run_btn_llm)]:
             try: w.setEnabled(enabled)
@@ -1047,6 +1073,7 @@ class MainWindow(QMainWindow):
             self._config.update({"input_path": self._drop_zone.text(), "output_dir": self._output_input.text(),
                                  "use_llm": self._proc_tabs.currentIndex() == 1, "api_configs": self._api_configs,
                                  "batch_size": self._batch_spin.value(), "max_concurrent": self._concurrent_spin.value(),
+                                 "max_tokens": self._max_tokens_spin.value(),
                                  "default_model": self._default_model.text(), "default_api_key": self._default_api_key.text()})
             save_config(self._config)
         except Exception as e: _logger.warning("save config: %s", e)
@@ -1058,6 +1085,7 @@ class MainWindow(QMainWindow):
         if cfg.get("use_llm"): self._proc_tabs.setCurrentIndex(1)
         if v := cfg.get("batch_size"): self._batch_spin.setValue(v)
         if (v := cfg.get("max_concurrent", 0)) is not None: self._concurrent_spin.setValue(v)
+        if (v := cfg.get("max_tokens", 384000)): self._max_tokens_spin.setValue(v)
         if cfg.get("default_model"): self._default_model.setText(cfg["default_model"])
         if cfg.get("default_api_key"): self._default_api_key.setText(cfg["default_api_key"])
         self._api_configs = cfg.get("api_configs", [])
