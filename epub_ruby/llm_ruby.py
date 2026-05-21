@@ -1379,50 +1379,322 @@ Output ONLY the JSON object. Nothing else."""
     _REPAIR_SYSTEM_PROMPT = """\
 You are a kanji→hiragana converter. Output ONLY a JSON object.
 
-For the sentence below, give the hiragana reading for EVERY kanji word.
+Below are numbered Japanese sentences. Find EVERY kanji word in EVERY
+sentence and give its hiragana reading. Do NOT skip any kanji word.
 
-CRITICAL:
-- Output ONLY: {"word1":"reading1","word2":"reading2",...}
-- Each key is the EXACT kanji word copied from the sentence — including ALL okurigana
+Output format: {"r":[{...},{...},...]}
+- The array contains kanji→hiragana dicts, one per input line (1:1 positional)
+- Each key is a kanji word copied EXACTLY from the input — include ALL okurigana
 - If a kanji appears inside a compound (e.g. 前 inside お前), annotate THE COMPOUND: "お前":"おまえ"
 - Each value is PURE HIRAGANA only — no "=", no "()", no spaces, no punctuation
-- The sentence provides context for disambiguating readings (e.g. 人→ひと vs にん)
-- Pay attention to compound verbs: 思い出す→おもいだす, not 思→? + 出→で
 - Annotate EVERY kanji — even single common kanji like 様, 前, 少, 方, 一, 見, 彼, 間, 中, 後, 今, 全, 必, 何, 私, 子, 番, 等, 来, 着, 楽, 決, 最, 他, 殿, 派, 流, 俺
-- Count the kanji words before responding — verify you haven't missed any
 
 Output ONLY the JSON object. Nothing else."""
 
     _REPAIR_SYSTEM_PROMPT_RETRY = """\
 You are a kanji→hiragana converter. Output ONLY a JSON object.
 
-CRITICAL: Your previous response for this sentence was INCOMPLETE — you
-MISSED some kanji. This time you MUST annotate EVERY kanji character
-in the sentence. Do NOT skip any kanji, no matter how common or simple.
+CRITICAL: Your previous response was INCOMPLETE — you MISSED some
+kanji. Below are numbered Japanese sentences. This time you MUST
+annotate EVERY kanji in EVERY sentence. Do NOT skip any.
 
-These are the kanji you MUST annotate this time:
-前(まえ/ぜん), 後(あと/ご/のち), 中(なか/ちゅう), 間(あいだ/かん/ま),
-方(かた/ほう), 今(いま/こん), 日(ひ/にち/じつ), 時(とき/じ),
-上(うえ/じょう), 下(した/か/げ), 右(みぎ), 左(ひだり),
-一(ひと/いち), 二(ふた/に), 大(おお/だい/たい), 小(ちい/しょう),
-何(なに/なん), 誰(だれ), 私(わたし/わたくし), 彼(かれ/かの),
-様(さま/よう), 殿(どの), 全(すべ/ぜん), 必(かなら/ひつ),
-見(み/けん), 言(い/げん), 思(おも/し), 行(い/ゆ/こう),
-子(こ/し), 番(ばん), 等(など/とう), 来(く/らい),
-着(つ/ちゃく), 楽(たの/らく), 決(き/けつ), 最(さい/もっと),
-他(ほか/た), 嘘(うそ), 派(は), 流(なが/りゅう),
-商会(しょうかい), 殿(どの), 俺(おれ), 前(まえ)
+Output format: {"r":[{...},{...},...]}
+- The array contains kanji→hiragana dicts, one per input line (1:1 positional)
+- Each key is a kanji word copied EXACTLY from the input — include ALL okurigana
+- If a kanji appears inside a compound, annotate THE COMPOUND
+- Each value is PURE HIRAGANA — no "=", no "()", no spaces
 
-CRITICAL RULES:
-- Output ONLY: {"word1":"reading1","word2":"reading2",...}
-- Each key is a kanji word copied EXACTLY from the sentence — include ALL okurigana
-- If a kanji appears inside a compound (e.g. 前 inside お前), annotate THE COMPOUND: "お前":"おまえ"
-- Each value is PURE HIRAGANA — no "=", no "()", no spaces, no punctuation
-- Read words in FULL sentence context: 思い出す→おもいだす, not 思→? + 出→で
-- Annotate ALL kanji — if the sentence has 20 kanji words, output 20 entries
-- Count the kanji before responding — verify you haven't missed any
+Commonly-missed kanji you MUST annotate:
+前, 後, 中, 間, 方, 今, 日, 時, 一, 大, 小, 何, 誰, 私, 彼, 様,
+殿, 全, 必, 見, 言, 思, 行, 子, 番, 等, 来, 着, 楽, 決, 最, 他,
+派, 流, 俺, 嘘
 
 Output ONLY the JSON object. Nothing else."""
+
+    @staticmethod
+    def _collect_still_missed(
+        sentences: list[str],
+        result: dict[str, dict[str, str]],
+    ) -> dict[str, list[str]]:
+        """Collect sentences that still have missed or zero kanji readings.
+
+        Unlike the original logic that skipped sentences with zero
+        readings, this method includes them with ALL kanji words
+        marked as missed, so downstream stages can attempt repair.
+        """
+        still_missed: dict[str, list[str]] = {}
+        for sentence in sentences:
+            if sentence not in result or not result[sentence]:
+                # Zero readings — mark ALL kanji as missed
+                if _contains_kanji(sentence):
+                    still_missed[sentence] = _extract_kanji_words(sentence)
+                continue
+            kanji_words = _extract_kanji_words(sentence)
+            covered = set(result[sentence].keys())
+            missed = [
+                w for w in kanji_words
+                if not _is_kanji_covered(w, covered)
+            ]
+            if missed:
+                still_missed[sentence] = missed
+        return still_missed
+
+    def _repair_batch(
+        self, sentences: list[str],
+        use_retry_prompt: bool = False,
+        temperature: float = 0.0,
+    ) -> dict[str, dict[str, str] | None]:
+        """Repair a BATCH of sentences with a single LLM call.
+
+        Uses the same numbered-line format as ``_call_api_batch``,
+        with repair-specific system prompts.  Each batch shares
+        one system prompt, saving tokens vs per-sentence calls.
+
+        Returns ``{sentence: readings_dict_or_None}``.  None means
+        the LLM returned nothing for that sentence.
+        """
+        if not sentences:
+            return {}
+
+        system_prompt = (
+            self._REPAIR_SYSTEM_PROMPT_RETRY if use_retry_prompt
+            else self._REPAIR_SYSTEM_PROMPT
+        )
+
+        # Build numbered input
+        input_lines = [f"[{i + 1}] {s}" for i, s in enumerate(sentences)]
+        user_prompt = "\n".join(input_lines)
+
+        try:
+            content = self._pool.llm_call(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=self._model,
+                temperature=temperature,
+                max_tokens=self._max_tokens,
+            )
+        except Exception:
+            # ── API call failed → try to salvage from last response ──
+            # Don't fail the whole batch — return a partial result
+            # so individual sentences that DID get readings can be saved.
+            return self._salvage_or_none(sentences, "")
+
+        data = _extract_json(content)
+        raw_list = data.get("r") or data.get("results") or []
+
+        if not isinstance(raw_list, list):
+            # ── Non-standard format → try universal extraction first ──
+            universal = self._extract_readings_universal(data)
+            if universal:
+                return self._sentences_to_result(sentences, universal)
+            # Then try salvage
+            salvaged = self._salvage_or_none(sentences, content)
+            if salvaged is not None:
+                return salvaged
+            return {s: None for s in sentences}
+
+        # Build a flat dict of all readings
+        all_readings: dict[str, str] = {}
+        for item in raw_list:
+            if isinstance(item, dict):
+                raw_dict: dict[str, str] = {}
+                for k, v in item.items():
+                    if isinstance(k, str) and k.strip():
+                        raw_dict[k.strip()] = str(v) if isinstance(v, str) else str(v)
+                sanitized = _sanitize_readings_dict(raw_dict)
+                for word, reading in sanitized.items():
+                    if word not in all_readings:
+                        all_readings[word] = reading
+
+        if not all_readings:
+            # ── Empty readings → try universal extraction ──
+            universal = self._extract_readings_universal(data)
+            if universal:
+                return self._sentences_to_result(sentences, universal)
+            # Then try salvage
+            salvaged = self._salvage_or_none(sentences, content)
+            if salvaged is not None:
+                return salvaged
+            return self._sentences_to_result(sentences, {})
+
+        # Match readings back to sentences via substring
+        return self._sentences_to_result(sentences, all_readings)
+
+    @staticmethod
+    def _sentences_to_result(
+        sentences: list[str],
+        all_readings: dict[str, str],
+    ) -> dict[str, dict[str, str] | None]:
+        """Match a flat readings dict to individual sentences.
+
+        Returns ``{sentence: readings_dict_or_None}``.  Only sentences
+        that actually contain matching readings get a dict; others get
+        None so callers know they need further repair.
+        """
+        result: dict[str, dict[str, str] | None] = {}
+        for sentence in sentences:
+            sent_norm = unicodedata.normalize("NFKC", sentence)
+            sent_readings: dict[str, str] = {}
+            for word, reading in all_readings.items():
+                word_norm = unicodedata.normalize("NFKC", word)
+                if word_norm in sent_norm:
+                    sent_readings[word] = reading
+            if sent_readings:
+                result[sentence] = sent_readings
+            else:
+                result[sentence] = None
+        return result
+
+    def _salvage_or_none(
+        self, sentences: list[str], content: str,
+    ) -> dict[str, dict[str, str] | None] | None:
+        """Try to salvage partial JSON from a failed/malformed response.
+
+        Returns a sentence→readings mapping, or None if nothing can
+        be salvaged.
+        """
+        if not content:
+            return None
+        salvaged_items, count = _salvage_partial_json(content, len(sentences))
+        if salvaged_items is None or count == 0:
+            return None
+
+        # Convert salvaged items to flat readings dict
+        all_readings2: dict[str, str] = {}
+        for item in salvaged_items:
+            if isinstance(item, dict):
+                raw_dict: dict[str, str] = {}
+                for k, v in item.items():
+                    if isinstance(k, str) and k.strip():
+                        raw_dict[k.strip()] = str(v) if isinstance(v, str) else str(v)
+                sanitized = _sanitize_readings_dict(raw_dict)
+                for word, reading in sanitized.items():
+                    if word not in all_readings2:
+                        all_readings2[word] = reading
+
+        if not all_readings2:
+            return None
+
+        return self._sentences_to_result(sentences, all_readings2)
+
+    def _repair_batch_targeted(
+        self, sentences: list[str],
+        hints: list[list[str]],
+    ) -> dict[str, dict[str, str] | None]:
+        """Repair a batch with per-sentence missed-word hints.
+
+        Unlike ``_repair_batch`` which sends a generic "annotate ALL
+        kanji" prompt, this method tells the LLM exactly which words
+        it missed in EACH sentence.  This combines token efficiency
+        (one system prompt) with precision (per-sentence targets).
+
+        Returns ``{sentence: readings_dict_or_None}``.
+        """
+        if not sentences:
+            return {}
+
+        system_prompt = self._REPAIR_SYSTEM_PROMPT_RETRY
+
+        # Build numbered input with per-sentence hints
+        lines: list[str] = []
+        for i, (s, h) in enumerate(zip(sentences, hints)):
+            lines.append(f"[{i + 1}] {s}")
+            if h:
+                word_list = "、".join(h)
+                lines.append(f"    ↑ Missed: {word_list}")
+        user_prompt = "\n".join(lines)
+
+        try:
+            content = self._pool.llm_call(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=self._model,
+                temperature=0.2,
+                max_tokens=self._max_tokens,
+            )
+        except Exception:
+            # ── API failed → per-sentence None (same as _repair_batch) ──
+            return {s: None for s in sentences}
+
+        data = _extract_json(content)
+        raw_list = data.get("r") or data.get("results") or []
+        if not isinstance(raw_list, list):
+            universal = self._extract_readings_universal(data)
+            if universal:
+                return self._sentences_to_result(sentences, universal)
+            salvaged = self._salvage_or_none(sentences, content)
+            if salvaged is not None:
+                return salvaged
+            return {s: None for s in sentences}
+
+        all_readings: dict[str, str] = {}
+        for item in raw_list:
+            if isinstance(item, dict):
+                raw_dict: dict[str, str] = {}
+                for k, v in item.items():
+                    if isinstance(k, str) and k.strip():
+                        raw_dict[k.strip()] = str(v) if isinstance(v, str) else str(v)
+                sanitized = _sanitize_readings_dict(raw_dict)
+                for word, reading in sanitized.items():
+                    if word not in all_readings:
+                        all_readings[word] = reading
+
+        if not all_readings:
+            universal = self._extract_readings_universal(data)
+            if universal:
+                return self._sentences_to_result(sentences, universal)
+            salvaged = self._salvage_or_none(sentences, content)
+            if salvaged is not None:
+                return salvaged
+            return self._sentences_to_result(sentences, {})
+
+        return self._sentences_to_result(sentences, all_readings)
+
+    @staticmethod
+    def _extract_readings_universal(data: Any) -> dict[str, str] | None:
+        """Extract word→reading mappings from ANY dict-like JSON structure.
+
+        Handles non-standard LLM response formats:
+        - Flat dict: ``{"word":"reading", ...}``
+        - Top-level array: ``[{...}, {...}]``
+        - Integer-keyed dict: ``{"0": {...}, "1": {...}}``
+        - Nested under any key: ``{"foo": [{...}, ...]}``
+
+        Returns a flat ``{word: reading}`` dict, or None.
+        """
+        if not isinstance(data, dict):
+            return None
+
+        all_readings: dict[str, str] = {}
+
+        def _collect(d: Any) -> None:
+            if isinstance(d, dict):
+                # Check if this dict looks like a readings dict
+                # (keys are kanji strings, values are hiragana strings)
+                has_kanji_keys = any(
+                    isinstance(k, str) and _contains_kanji(k)
+                    for k in d.keys()
+                )
+                if has_kanji_keys:
+                    raw = {
+                        str(k): str(v)
+                        for k, v in d.items()
+                        if isinstance(k, str) and isinstance(v, (str, int, float))
+                    }
+                    sanitized = _sanitize_readings_dict(raw)
+                    for w, r in sanitized.items():
+                        if w not in all_readings:
+                            all_readings[w] = r
+                else:
+                    # Recurse into sub-dicts
+                    for v in d.values():
+                        _collect(v)
+            elif isinstance(d, list):
+                for item in d:
+                    _collect(item)
+
+        _collect(data)
+        return all_readings if all_readings else None
 
     def _repair_missed_readings(
         self,
@@ -1465,44 +1737,57 @@ Output ONLY the JSON object. Nothing else."""
 
         still_missed_sentences: dict[str, list[str]] = {}  # sentence → missed words
 
-        with ThreadPoolExecutor(max_workers=len(repair_sentences)) as executor:
+        # ── Batch repair: group sentences into batch_size chunks ──
+        batch_size = max(1, self._batch_size)
+        batches: list[list[str]] = []
+        for i in range(0, len(repair_sentences), batch_size):
+            batches.append(repair_sentences[i : i + batch_size])
+
+        self._log(
+            f"  → {len(batches)} repair batch(es) × ~{batch_size} sentences"
+        )
+
+        with ThreadPoolExecutor(max_workers=len(batches)) as executor:
             futures = {
-                executor.submit(self._repair_one_sentence, sentence, None): sentence
-                for sentence in repair_sentences
+                executor.submit(
+                    self._repair_batch, batch, False  # use_retry_prompt=False
+                ): batch
+                for batch in batches
             }
             for future in as_completed(futures):
-                sentence, sanitized, error = future.result()
-                if sanitized is not None:
-                    if sentence in result:
-                        result[sentence].update(sanitized)
-                    else:
-                        result[sentence] = sanitized
-                    total_repaired += len(sanitized)
-                    self._log(
-                        f"  ↻ [S1] repaired {len(sanitized)} word(s): "
-                        f"{sentence[:60]}",
-                    )
-                    # Check for remaining misses
-                    kanji_words = _extract_kanji_words(sentence)
-                    covered = set(result.get(sentence, {}).keys())
-                    missed = [
-                        w for w in kanji_words
-                        if not _is_kanji_covered(w, covered)
-                    ]
-                    if missed:
-                        still_missed_sentences[sentence] = missed
+                batch_result = future.result()
+                for sentence, sanitized in batch_result.items():
+                    if sanitized is not None:
+                        if sentence in result:
+                            result[sentence].update(sanitized)
+                        else:
+                            result[sentence] = sanitized
+                        total_repaired += len(sanitized)
                         self._log(
-                            f"  ⚠ [S1] still missed: {missed}",
+                            f"  ↻ [S1] repaired {len(sanitized)} word(s): "
+                            f"{sentence[:60]}",
+                        )
+                        # Check for remaining misses
+                        kanji_words = _extract_kanji_words(sentence)
+                        covered = set(result.get(sentence, {}).keys())
+                        missed = [
+                            w for w in kanji_words
+                            if not _is_kanji_covered(w, covered)
+                        ]
+                        if missed:
+                            still_missed_sentences[sentence] = missed
+                            self._log(
+                                f"  ⚠ [S1] still missed: {missed}",
+                                "warning",
+                            )
+                    else:
+                        self._log(
+                            f"  ✗ [S1] repair failed: "
+                            f"{sentence[:60]}... (LLM returned empty)",
                             "warning",
                         )
-                else:
-                    self._log(
-                        f"  ✗ [S1] repair failed: {sentence[:60]}... ({error})",
-                        "warning",
-                    )
-                    # If repair failed entirely, mark all kanji as missed
-                    if _contains_kanji(sentence):
-                        still_missed_sentences[sentence] = _extract_kanji_words(sentence)
+                        if _contains_kanji(sentence):
+                            still_missed_sentences[sentence] = _extract_kanji_words(sentence)
 
         self._log(
             f"Stage 1 complete: {total_repaired} word(s) fixed, "
@@ -1510,57 +1795,55 @@ Output ONLY the JSON object. Nothing else."""
         )
 
         # ═══════════════════════════════════════════════════════════
-        # Stage 2: Retry with escalated prompt (no word list!)
+        # Stage 2: Retry with escalated prompt (batched!)
         # ═══════════════════════════════════════════════════════════
         if still_missed_sentences:
+            s2_sentences = list(still_missed_sentences.keys())
             self._log(
-                f"Stage 2 — Retrying {len(still_missed_sentences)} "
-                f"sentence(s) with escalated prompt (no word list)..."
+                f"Stage 2 — Retrying {len(s2_sentences)} "
+                f"sentence(s) with escalated prompt (batched)..."
             )
 
-            with ThreadPoolExecutor(
-                max_workers=len(still_missed_sentences)
-            ) as executor:
+            s2_batches: list[list[str]] = []
+            for i in range(0, len(s2_sentences), batch_size):
+                s2_batches.append(s2_sentences[i : i + batch_size])
+
+            self._log(
+                f"  → {len(s2_batches)} repair batch(es) × ~{batch_size} sentences"
+            )
+
+            with ThreadPoolExecutor(max_workers=len(s2_batches)) as executor:
                 futures2 = {
                     executor.submit(
-                        self._repair_one_sentence, sentence,
-                        None,  # no word list
+                        self._repair_batch, batch,
                         True,  # use_retry_prompt=True
-                    ): sentence
-                    for sentence in still_missed_sentences
+                    ): batch
+                    for batch in s2_batches
                 }
                 for future in as_completed(futures2):
-                    sentence, sanitized, error = future.result()
-                    if sanitized is not None:
-                        if sentence in result:
-                            result[sentence].update(sanitized)
+                    batch_result = future.result()
+                    for sentence, sanitized in batch_result.items():
+                        if sanitized is not None:
+                            if sentence in result:
+                                result[sentence].update(sanitized)
+                            else:
+                                result[sentence] = sanitized
+                            total_repaired += len(sanitized)
+                            self._log(
+                                f"  ↻ [S2] repaired {len(sanitized)} word(s): "
+                                f"{sentence[:60]}",
+                            )
                         else:
-                            result[sentence] = sanitized
-                        total_repaired += len(sanitized)
-                        self._log(
-                            f"  ↻ [S2] repaired {len(sanitized)} word(s): "
-                            f"{sentence[:60]}",
-                        )
-                    else:
-                        self._log(
-                            f"  ✗ [S2] retry failed: "
-                            f"{sentence[:60]}... ({error})",
-                            "error",
-                        )
+                            self._log(
+                                f"  ✗ [S2] retry failed: "
+                                f"{sentence[:60]}... (LLM returned empty)",
+                                "error",
+                            )
 
             # Collect still-missed for Stage 3
-            still_missed_sentences.clear()
-            for sentence in repair_sentences:
-                if sentence not in result or not result[sentence]:
-                    continue
-                kanji_words = _extract_kanji_words(sentence)
-                covered = set(result.get(sentence, {}).keys())
-                missed = [
-                    w for w in kanji_words
-                    if not _is_kanji_covered(w, covered)
-                ]
-                if missed:
-                    still_missed_sentences[sentence] = missed
+            still_missed_sentences = self._collect_still_missed(
+                repair_sentences, result
+            )
 
             self._log(
                 f"Stage 2 complete: {total_repaired} total word(s) fixed, "
@@ -1568,12 +1851,10 @@ Output ONLY the JSON object. Nothing else."""
             )
 
         # ═══════════════════════════════════════════════════════════
-        # Stage 3: Multi-pass retry for stubborn sentences
-        # Retry each sentence up to 5 times.  Track which words
-        # consistently fail — if the same word fails 5 times,
-        # it's a systematic code issue, not LLM randomness.
+        # Stage 3: Multi-pass retry for stubborn sentences (BATCHED!)
+        # Each pass sends ALL remaining sentences in ONE API call.
         # ═══════════════════════════════════════════════════════════
-        MAX_RETRY_PASSES = 5
+        MAX_RETRY_PASSES = 1
         retry_pass = 0
         while still_missed_sentences and retry_pass < MAX_RETRY_PASSES:
             retry_pass += 1
@@ -1581,39 +1862,41 @@ Output ONLY the JSON object. Nothing else."""
             failure_tracker: dict[str, list[str]] = {}  # word → [sentence_preview, ...]
 
             # ── Temperature: start at 0.0, increase gradually ──
-            # Early passes use 0.0 (deterministic), later passes use
-            # slightly higher temp (0.1–0.2) to get different outputs.
             stage3_temp = min(0.2, (retry_pass - 1) * 0.05)
+
+            s3_sentences = list(still_missed_sentences.keys())
+            s3_batches: list[list[str]] = []
+            for i in range(0, len(s3_sentences), batch_size):
+                s3_batches.append(s3_sentences[i : i + batch_size])
 
             self._log(
                 f"Stage 3 pass {retry_pass}/{MAX_RETRY_PASSES} — "
-                f"Retrying {len(still_missed_sentences)} stubborn sentence(s)"
+                f"{len(s3_sentences)} sentence(s) in "
+                f"{len(s3_batches)} batch(es)"
                 f"{' (temp=' + str(stage3_temp) + ')' if stage3_temp > 0 else ''}..."
             )
 
-            with ThreadPoolExecutor(
-                max_workers=len(still_missed_sentences)
-            ) as executor:
+            with ThreadPoolExecutor(max_workers=len(s3_batches)) as executor:
                 futures3 = {
                     executor.submit(
-                        self._repair_one_sentence, sentence,
-                        None, True,  # use_retry_prompt
-                        stage3_temp,  # temperature
-                    ): sentence
-                    for sentence in still_missed_sentences
+                        self._repair_batch, batch,
+                        True, stage3_temp,  # use_retry_prompt, temperature
+                    ): batch
+                    for batch in s3_batches
                 }
                 for future in as_completed(futures3):
-                    sentence, sanitized, error = future.result()
-                    if sanitized is not None:
-                        if sentence in result:
-                            result[sentence].update(sanitized)
-                        else:
-                            result[sentence] = sanitized
-                        total_repaired += len(sanitized)
+                    batch_result = future.result()
+                    for sentence, sanitized in batch_result.items():
+                        if sanitized is not None:
+                            if sentence in result:
+                                result[sentence].update(sanitized)
+                            else:
+                                result[sentence] = sanitized
+                            total_repaired += len(sanitized)
 
             # Re-check which sentences still have misses
             next_still_missed: dict[str, list[str]] = {}
-            for sentence in still_missed_sentences:
+            for sentence in s3_sentences:
                 if sentence not in result or not result[sentence]:
                     next_still_missed[sentence] = _extract_kanji_words(sentence)
                     continue
@@ -1629,7 +1912,7 @@ Output ONLY the JSON object. Nothing else."""
                         if w not in failure_tracker:
                             failure_tracker[w] = []
                         failure_tracker[w].append(sentence)
-                    # Debug dump: what readings DO exist for this sentence?
+                    # Debug dump
                     if retry_pass >= 1:
                         existing = result.get(sentence, {})
                         _logger.error(
@@ -1646,7 +1929,6 @@ Output ONLY the JSON object. Nothing else."""
                     f"  After pass {retry_pass}: {len(still_missed_sentences)} "
                     f"sentence(s), {total_still} word(s) still missed"
                 )
-                # Log persistent failures for analysis (full sentences, to log file)
                 if retry_pass >= 2:
                     for word, contexts in sorted(failure_tracker.items()):
                         if len(contexts) >= 2:
@@ -1668,64 +1950,76 @@ Output ONLY the JSON object. Nothing else."""
             )
 
         # ═══════════════════════════════════════════════════════════
-        # Stage 4: Per-word targeted repair with full sentence context
+        # Stage 4: Targeted repair — batched with per-sentence hints
         #
-        # For each stubborn word, send the FULL sentence (not split)
-        # but explicitly name the missed word and its surrounding
-        # phrase so the LLM can disambiguate the reading from context.
-        # This is categorically different from "word splitting" —
-        # the full sentence always provides complete context.
+        # Sends ALL sentences in ONE batch, but each sentence gets
+        # its own "Missed: word1, word2" hint.  This combines the
+        # token efficiency of batching with the precision of
+        # per-sentence word targeting.
         # ═══════════════════════════════════════════════════════════
         if still_missed_sentences:
             total_still = sum(len(v) for v in still_missed_sentences.values())
             self._log(
-                f"Stage 4 — Targeted per-word repair of {total_still} "
+                f"Stage 4 — Targeted repair of {total_still} "
                 f"stubborn word(s) in {len(still_missed_sentences)} "
-                f"sentence(s) (full context, individual word focus)..."
+                f"sentence(s) (batched with per-sentence hints)..."
+            )
+
+            # ── Build batched prompt with per-sentence missed words ──
+            s4_sentences = list(still_missed_sentences.keys())
+            s4_batches: list[list[str]] = []
+            s4_hints: list[list[list[str]]] = []  # parallel: hints[i][j] = words for batch[i] sentence[j]
+            for i in range(0, len(s4_sentences), batch_size):
+                batch = s4_sentences[i : i + batch_size]
+                s4_batches.append(batch)
+                hints = [
+                    still_missed_sentences.get(s, [])
+                    for s in batch
+                ]
+                s4_hints.append(hints)
+
+            self._log(
+                f"  → {len(s4_batches)} repair batch(es) × ~{batch_size} sentences"
             )
 
             stage4_repaired = 0
-            with ThreadPoolExecutor(
-                max_workers=len(still_missed_sentences)
-            ) as executor:
+            with ThreadPoolExecutor(max_workers=len(s4_batches)) as executor:
                 futures4 = {
                     executor.submit(
-                        self._repair_one_sentence, sentence,
-                        missed_words,     # pass specific missed words
-                        True,             # use_retry_prompt
-                        temperature=0.2,  # slightly higher temp for variety
-                    ): (sentence, missed_words)
-                    for sentence, missed_words in still_missed_sentences.items()
+                        self._repair_batch_targeted, batch, hints
+                    ): (batch, hints)
+                    for batch, hints in zip(s4_batches, s4_hints)
                 }
                 for future in as_completed(futures4):
-                    orig_sentence, orig_missed = futures4[future]
-                    sentence, sanitized, error = future.result()
-                    if sanitized is not None:
-                        if sentence in result:
-                            result[sentence].update(sanitized)
-                        else:
-                            result[sentence] = sanitized
-                        stage4_repaired += len(sanitized)
-                        self._log(
-                            f"  ↻ [S4] repaired {len(sanitized)} word(s): "
-                            f"{sentence[:60]}",
-                        )
-                    else:
-                        # Last resort: try each word individually
-                        for word in orig_missed:
-                            single_result = self._repair_one_word_in_context(
-                                orig_sentence, word
+                    batch_result = future.result()
+                    for sentence, sanitized in batch_result.items():
+                        if sanitized is not None:
+                            if sentence in result:
+                                result[sentence].update(sanitized)
+                            else:
+                                result[sentence] = sanitized
+                            stage4_repaired += len(sanitized)
+                            self._log(
+                                f"  ↻ [S4] repaired {len(sanitized)} word(s): "
+                                f"{sentence[:60]}",
                             )
-                            if single_result is not None:
-                                if orig_sentence in result:
-                                    result[orig_sentence].update(single_result)
-                                else:
-                                    result[orig_sentence] = single_result
-                                stage4_repaired += len(single_result)
-                                self._log(
-                                    f"  ↻ [S4-single] repaired '{word}': "
-                                    f"{orig_sentence[:60]}",
+                        else:
+                            # Fall back to per-word repair
+                            missed = still_missed_sentences.get(sentence, [])
+                            for word in missed:
+                                single_result = self._repair_one_word_in_context(
+                                    sentence, word
                                 )
+                                if single_result is not None:
+                                    if sentence in result:
+                                        result[sentence].update(single_result)
+                                    else:
+                                        result[sentence] = single_result
+                                    stage4_repaired += len(single_result)
+                                    self._log(
+                                        f"  ↻ [S4-single] repaired '{word}': "
+                                        f"{sentence[:60]}",
+                                    )
 
             total_repaired += stage4_repaired
             self._log(
@@ -1733,18 +2027,9 @@ Output ONLY the JSON object. Nothing else."""
             )
 
             # Re-check after Stage 4
-            still_missed_sentences.clear()
-            for sentence in repair_sentences:
-                if sentence not in result or not result[sentence]:
-                    continue
-                kanji_words = _extract_kanji_words(sentence)
-                covered = set(result[sentence].keys())
-                missed = [
-                    w for w in kanji_words
-                    if not _is_kanji_covered(w, covered)
-                ]
-                if missed:
-                    still_missed_sentences[sentence] = missed
+            still_missed_sentences = self._collect_still_missed(
+                repair_sentences, result
+            )
 
             if still_missed_sentences:
                 # ═══════════════════════════════════════════════════
@@ -1763,9 +2048,22 @@ Output ONLY the JSON object. Nothing else."""
                 )
 
                 stage5_repaired = 0
-                for sentence, missed_words in list(still_missed_sentences.items()):
-                    for word in missed_words:
-                        reading = self._ask_plain_reading(sentence, word)
+                # Collect all (sentence, word) pairs
+                s5_tasks = [
+                    (sentence, word)
+                    for sentence, words in still_missed_sentences.items()
+                    for word in words
+                ]
+                with ThreadPoolExecutor(max_workers=len(s5_tasks)) as executor:
+                    futures5 = {
+                        executor.submit(
+                            self._ask_plain_reading, s, w
+                        ): (s, w)
+                        for s, w in s5_tasks
+                    }
+                    for future in as_completed(futures5):
+                        sentence, word = futures5[future]
+                        reading = future.result()
                         if reading:
                             entry = {word: reading}
                             if sentence in result:
@@ -1777,7 +2075,6 @@ Output ONLY the JSON object. Nothing else."""
                                 f"  ↻ [S5] '{word}' → '{reading}': "
                                 f"{sentence[:60]}",
                             )
-                            # Also save to cache
                             norm = _normalize_sentence(sentence)
                             self._cache_put(norm, result.get(sentence, {}))
 
@@ -1788,18 +2085,9 @@ Output ONLY the JSON object. Nothing else."""
                 )
 
                 # Re-check after Stage 5
-                still_missed_sentences.clear()
-                for sentence in repair_sentences:
-                    if sentence not in result or not result[sentence]:
-                        continue
-                    kanji_words = _extract_kanji_words(sentence)
-                    covered = set(result[sentence].keys())
-                    missed = [
-                        w for w in kanji_words
-                        if not _is_kanji_covered(w, covered)
-                    ]
-                    if missed:
-                        still_missed_sentences[sentence] = missed
+                still_missed_sentences = self._collect_still_missed(
+                    repair_sentences, result
+                )
 
                 if still_missed_sentences:
                     total_missed = sum(len(v) for v in still_missed_sentences.values())
@@ -1844,34 +2132,39 @@ Output ONLY the JSON object. Nothing else."""
         Returns (sentence, readings_dict_or_None, error_msg_or_None).
         """
         if words and use_retry_prompt:
-            # ── Targeted retry: full sentence + specific missed words ──
+            # ── Targeted retry: sentence FIRST as context, then task ──
             unique_words = list(dict.fromkeys(w for w in words if w.strip()))
             word_list = "、".join(unique_words)
             user_prompt = (
-                f"Sentence: {sentence}\n"
-                f"You previously MISSED these kanji: {word_list}\n"
-                f"Annotate ALL kanji including these — use full sentence context.\n"
-                f"Do NOT skip any of the listed words."
+                f"{sentence}\n"
+                f"In the sentence above, annotate ALL kanji words. "
+                f"Pay special attention to these words you missed before: "
+                f"{word_list}\n"
+                f"Use the FULL context of the sentence above to determine "
+                f"the correct readings."
             )
             system_prompt = self._REPAIR_SYSTEM_PROMPT_RETRY
         elif words:
             unique_words = list(dict.fromkeys(w for w in words if w.strip()))
             word_list = "、".join(unique_words)
             user_prompt = (
-                f"Sentence: {sentence}\n"
-                f"Annotate these kanji words (use sentence context!): {word_list}"
+                f"{sentence}\n"
+                f"In the sentence above, give hiragana readings for "
+                f"these kanji words: {word_list}"
             )
             system_prompt = self._REPAIR_SYSTEM_PROMPT  # fallback
         elif use_retry_prompt:
             user_prompt = (
-                f"Sentence: {sentence}\n"
-                f"Annotate ALL kanji — do NOT skip any this time."
+                f"{sentence}\n"
+                f"In the sentence above, annotate ALL kanji — "
+                f"do NOT skip any this time."
             )
             system_prompt = self._REPAIR_SYSTEM_PROMPT_RETRY
         else:
             user_prompt = (
-                f"Sentence: {sentence}\n"
-                f"Give hiragana readings for ALL kanji words."
+                f"{sentence}\n"
+                f"In the sentence above, give hiragana readings "
+                f"for ALL kanji words."
             )
             system_prompt = self._REPAIR_SYSTEM_PROMPT
 
@@ -1971,15 +2264,16 @@ Output ONLY the JSON object. Nothing else."""
         system_prompt = (
             "You are a kanji→hiragana converter. Output ONLY a JSON object.\n"
             "Give the hiragana reading for the kanji word marked with 《》.\n"
-            "Use the surrounding context to determine the correct reading.\n"
+            "Use the sentence context ABOVE to determine the correct reading.\n"
             "Output ONLY: {\"word\":\"reading\"}\n"
             "The key must be the EXACT kanji word (without 《》 marks).\n"
             "The value must be PURE HIRAGANA only."
         )
         user_prompt = (
-            f"Full sentence: {sentence}\n"
-            f"Context phrase: {marked}\n"
-            f"Give the reading for: {word}"
+            f"{sentence}\n"
+            f"In the sentence above, 「{word}」appears in this phrase:"
+            f"{marked}\n"
+            f"Give the reading of「{word}」in the sentence above."
         )
 
         return self._call_single_word_llm(system_prompt, user_prompt, sentence, word)
@@ -2022,16 +2316,18 @@ Output ONLY the JSON object. Nothing else."""
 
         system_prompt = (
             "You are a kanji→hiragana converter. Output ONLY a JSON object.\n"
-            "The sentence contains a kanji compound/phrase. Give hiragana\n"
-            "readings for ALL kanji words in the phrase below.\n"
+            "Read the sentence below, then look at the focus phrase.\n"
+            "Give hiragana readings for ALL kanji words in the focus phrase,\n"
+            "using the FULL sentence above for context.\n"
             "Output ONLY: {\"word1\":\"reading1\",...}\n"
             "Keys must be EXACT kanji words from the phrase.\n"
             "Values must be PURE HIRAGANA only."
         )
         user_prompt = (
-            f"Full sentence: {sentence}\n"
-            f"Focus phrase (contains '{word}'): {phrase}\n"
-            f"Annotate ALL kanji in this phrase."
+            f"{sentence}\n"
+            f"In the sentence above, 「{word}」appears in this phrase:"
+            f"{phrase}\n"
+            f"Annotate ALL kanji in this phrase using the context from the sentence above."
         )
 
         return self._call_single_word_llm(system_prompt, user_prompt, sentence, word)
@@ -2045,17 +2341,19 @@ Output ONLY the JSON object. Nothing else."""
         Annotate it NOW. Here is the full sentence."
         """
         system_prompt = (
-            "You are a kanji→hiragana converter. Output ONLY a JSON object.\n\n"
+            "You are a kanji→hiragana converter. Output ONLY a JSON object.\n"
             "CRITICAL: You have repeatedly FAILED to annotate a specific kanji\n"
-            "word. This is your LAST CHANCE. Output the correct reading.\n\n"
+            "word. This is your LAST CHANCE. Output the correct reading.\n"
             "Output ONLY: {\"word\":\"reading\"}\n"
             "The key MUST be the exact kanji word shown below.\n"
             "The value MUST be PURE HIRAGANA — no spaces, no punctuation.\n"
             "If you don't know the reading, give your BEST GUESS in hiragana."
         )
         user_prompt = (
-            f"Full sentence (for context): {sentence}\n\n"
-            f"Annotate THIS word: {word}\n\n"
+            f"Sentence:\n"
+            f"{sentence}\n"
+            f"In the sentence above, you keep missing this word:「{word}」\n"
+            f"Annotate it NOW using the context from the sentence above.\n"
             f"Output the JSON now. Do NOT skip this word."
         )
 
@@ -2164,9 +2462,9 @@ Output ONLY the JSON object. Nothing else."""
 
         # Strategy A: ask about the specific word in context
         user_prompt = (
-            f"Sentence: {sentence}\n\n"
-            f"What is the hiragana reading of 「{word}」 "
-            f"in this sentence?\n\n"
+            f"{sentence}\n"
+            f"In the sentence above, what is the hiragana reading "
+            f"of「{word}」?\n"
             f"Answer with ONLY hiragana."
         )
 
@@ -2186,11 +2484,10 @@ Output ONLY the JSON object. Nothing else."""
                 # If first attempt failed, try alternative prompt
                 if attempt == 0:
                     user_prompt = (
-                        f"Read this sentence aloud in your head:\n"
-                        f"{sentence}\n\n"
-                        f"Now tell me ONLY the hiragana reading "
-                        f"of the word 「{word}」.\n"
-                        f"Output: "
+                        f"{sentence}\n"
+                        f"In the sentence above, what is the hiragana "
+                        f"reading of「{word}」?\n"
+                        f"Output ONLY hiragana: "
                     )
             except Exception:
                 if attempt == 0:
