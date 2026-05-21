@@ -263,7 +263,7 @@ class EPUBHV:
             print(f"  [Phase 3] Applying readings to {total_files} file(s)...")
 
             def _apply_one(idx: int, ruby: RubySoup, soup: BeautifulSoup,
-                          html_file: Path) -> tuple[int, str, int]:
+                          html_file: Path) -> tuple[int, str, int, int]:
                 if soup.body is not None:
                     ruby._batch_readings = batch_readings
                     ruby._apply(soup.body)
@@ -272,10 +272,12 @@ class EPUBHV:
                     unicodedata.normalize("NFC", str(soup)),
                     encoding="utf-8")
                 print(f"  [{idx}/{total}] {html_file.name}")
-                return (idx, html_file.name, ruby._skipped_count)
+                return (idx, html_file.name, ruby._skipped_count,
+                        ruby._preserved_ruby_count)
 
             completed = 0
             total_skipped = 0
+            total_preserved = 0
             with ThreadPoolExecutor(max_workers=total_files if total_files else 1) as executor:
                 futures2 = {
                     executor.submit(_apply_one, i, rs, sp, f): i
@@ -283,16 +285,17 @@ class EPUBHV:
                 }
                 for future in as_completed(futures2):
                     # Propagate exceptions – don't silently skip failed files
-                    idx, fname, skipped = future.result()
+                    idx, fname, skipped, preserved = future.result()
                     total_skipped += skipped
+                    total_preserved += preserved
                     completed += 1
                     if self._progress_callback:
                         self._progress_callback(total_chunks + completed, total_work)
 
         else:
             # ── Dictionary mode: simple parallel ──
-            def _process_one(idx: int, html_file: Path) -> tuple[int, str]:
-                """Process a single file.  Returns (index, filename)."""
+            def _process_one(idx: int, html_file: Path) -> tuple[int, str, int]:
+                """Process a single file.  Returns (index, filename, preserved_count)."""
                 print(f"  [{idx}/{total}] {html_file.name}")
                 raw = html_file.read_text(encoding="utf-8", errors="ignore")
                 raw = unicodedata.normalize("NFC", raw)
@@ -302,10 +305,11 @@ class EPUBHV:
                     ruby = RubySoup(is_ruby_rp=True, llm_reader=llm_reader)
                     ruby.inject(soup.body)
                 html_file.write_text(str(soup), encoding="utf-8")
-                return (idx, html_file.name)
+                return (idx, html_file.name, ruby._preserved_ruby_count)
 
             workers = total if total else 1
             completed = 0
+            total_preserved = 0
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {
                     executor.submit(_process_one, i, f): i
@@ -313,7 +317,8 @@ class EPUBHV:
                 }
                 for future in as_completed(futures):
                     try:
-                        future.result()
+                        _, _, preserved = future.result()
+                        total_preserved += preserved
                         completed += 1
                         if self._progress_callback:
                             self._progress_callback(completed, total)
@@ -323,6 +328,12 @@ class EPUBHV:
                         if self._progress_callback:
                             self._progress_callback(completed, total)
 
+            if total_preserved > 0:
+                print(
+                    f"  Preserved {total_preserved} pre-existing "
+                    f"ruby tag(s) from original EPUB"
+                )
+
         if llm_reader is not None:
             stats = llm_reader.stats
             print(
@@ -331,6 +342,11 @@ class EPUBHV:
                 f"{stats['total_annotated']} words annotated, "
                 f"{stats['cache_hits']} cache hits"
             )
+            if total_preserved > 0:
+                print(
+                    f"  [LLM] Preserved {total_preserved} pre-existing "
+                    f"ruby tag(s) from original EPUB"
+                )
             if total_skipped > 0:
                 from .exceptions import LLMBatchError
                 total_sentences = len(all_items) if all_items else 0

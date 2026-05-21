@@ -23,14 +23,22 @@ from PySide6.QtWidgets import (
 
 LOG_DIR = Path.home() / ".epub_ruby"
 LOG_FILE = LOG_DIR / "errors.log"
+EPUB_RUBY_LOG = LOG_DIR / "epub_ruby.log"
 
 def _setup_file_logging():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    # errors.log — all logs (DEBUG+)
     h = logging.FileHandler(str(LOG_FILE), encoding="utf-8")
     h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    h.setLevel(logging.DEBUG)
+    # epub_ruby.log — errors and PERSISTENT only (ERROR+)
+    h2 = logging.FileHandler(str(EPUB_RUBY_LOG), encoding="utf-8")
+    h2.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    h2.setLevel(logging.ERROR)
     lg = logging.getLogger("epub_ruby")
     lg.setLevel(logging.DEBUG)
     lg.addHandler(h)
+    lg.addHandler(h2)
 
 _setup_file_logging()
 _logger = logging.getLogger("epub_ruby")

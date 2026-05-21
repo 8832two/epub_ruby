@@ -402,7 +402,7 @@ class RubySoup:
         (and not a ruby-related tag)."""
         for child in element.children:
             if isinstance(child, Tag):
-                if child.name in ("ruby", "rt", "rp"):
+                if child.name in ("ruby", "rt", "rp", "rb", "rtc"):
                     continue
                 if child.name in RubySoup._BLOCK_TAGS:
                     return True
@@ -421,6 +421,83 @@ class RubySoup:
         self._batch_readings_norm: Dict[str, Dict[str, str]] | None = None
         # Count of sentences that received NO readings from LLM (for summary)
         self._skipped_count: int = 0
+        # Count of pre-existing <ruby> tags preserved (for summary)
+        self._preserved_ruby_count: int = 0
+
+    # ------------------------------------------------------------------
+    # Helpers for pre-existing ruby tag preservation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_ruby_base_text(ruby_tag: Tag) -> str:
+        """Extract only the base kanji text from a <ruby> tag.
+
+        Skips <rt> (reading) and <rp> (fallback parentheses) children.
+        """
+        parts: List[str] = []
+        for child in ruby_tag.children:
+            if child is None:
+                continue
+            if isinstance(child, NavigableString) and not isinstance(
+                child, (Script, Stylesheet, TemplateString)
+            ):
+                parts.append(str(child))
+            elif isinstance(child, Tag):
+                if child.name in ("rt", "rp", "rtc"):
+                    continue
+                # rb contains the base text — extract text from it
+                parts.append(child.get_text())
+        return "".join(parts).strip()
+
+    @staticmethod
+    def _has_existing_ruby(element: Tag) -> bool:
+        """Return True if *element* or any descendant contains a <ruby> tag."""
+        return element.find("ruby") is not None
+
+    def _collect_preserved_ruby_tags(
+        self, element: Tag
+    ) -> list[tuple[str, Tag]]:
+        """Walk *element* and collect pre-existing <ruby> tags.
+
+        Returns an ordered list of ``(base_text, ruby_tag_copy)`` tuples
+        in document order.  Each tag copy is a **detached clone** created
+        via ``BeautifulSoup`` serialization so it won't be affected when
+        the original element's children are cleared.
+
+        Ruby tags nested inside inline elements (e.g. ``<b><ruby>…</ruby></b>``)
+        are also collected, so their author-provided readings are preserved.
+        """
+        preserved: list[tuple[str, Tag]] = []
+
+        def _walk(e: Tag) -> None:
+            for child in e.children:
+                if isinstance(child, Tag):
+                    if child.name == "ruby":
+                        base_text = self._extract_ruby_base_text(child)
+                        if base_text:
+                            # Deep copy via serialize → re-parse to ensure
+                            # the clone is fully detached from the original tree
+                            detached = BeautifulSoup(
+                                str(child), "html.parser",
+                                string_containers=string_containers,
+                            )
+                            tag_copy = detached.find("ruby")
+                            if tag_copy is not None:
+                                preserved.append((base_text, tag_copy))
+                    elif child.name not in self._BLOCK_TAGS:
+                        # Recurse into inline tags (b, i, span, etc.)
+                        _walk(child)
+
+        _walk(element)
+        return preserved
+
+    @staticmethod
+    def _replace_ruby_tag_with_base(ruby_tag: Tag) -> str:
+        """Return the base kanji text of a <ruby> tag as a plain string.
+
+        Used to extract the original kanji when we need to rebuild a block.
+        """
+        return RubySoup._extract_ruby_base_text(ruby_tag)
 
     def _get_batch_readings_norm(self) -> Dict[str, Dict[str, str]]:
         """Build and return a normalized-key → readings lookup dict.
@@ -472,6 +549,11 @@ class RubySoup:
         This gives the LLM full sentence context (e.g. "<b>漢字</b>を<b>勉強</b>"
         → "漢字を勉強") instead of fragmented pieces.
 
+        Pre-existing <ruby> annotations are respected: only the BASE text
+        (kanji) is extracted, while <rt> readings and <rp> fallback
+        parentheses are excluded.  This prevents the LLM from seeing
+        furigana as original content and avoids duplicate annotation.
+
         Japanese text is joined WITHOUT spaces — adding spaces would
         alter the semantics and waste input tokens.
         """
@@ -484,9 +566,31 @@ class RubySoup:
             ):
                 parts.append(str(child))
             elif isinstance(child, Tag):
-                if child.name in ("ruby", "rt", "rp"):
-                    continue
-                parts.append(child.get_text())
+                if child.name in ("rt", "rp"):
+                    continue  # skip reading / fallback text
+                if child.name == "ruby":
+                    # Extract ONLY the base kanji text — skip rt/rp
+                    base_parts: List[str] = []
+                    for rc in child.children:
+                        if rc is None:
+                            continue
+                        if isinstance(rc, NavigableString) and not isinstance(
+                            rc, (Script, Stylesheet, TemplateString)
+                        ):
+                            base_parts.append(str(rc))
+                        elif isinstance(rc, Tag):
+                            if rc.name in ("rt", "rp", "rtc"):
+                                continue
+                            # rb contains base text, other tags rare but handle
+                            base_parts.append(
+                                RubySoup._get_block_text(rc)
+                            )
+                    parts.append("".join(base_parts))
+                else:
+                    # For inline tags, recurse (handles nested ruby)
+                    parts.append(
+                        RubySoup._get_block_text(child)
+                    )
         # Collapse all whitespace (newlines, tabs, multiple spaces) into
         # nothing — Japanese doesn't use spaces as word separators.
         text = "".join(parts)
@@ -512,7 +616,7 @@ class RubySoup:
                 if text and _contains_kanji(text):
                     items.append(text)
             elif isinstance(child, Tag):
-                if child.name in ("ruby", "rt", "rp"):
+                if child.name in ("ruby", "rt", "rp", "rb", "rtc"):
                     continue
                 if child.name in self._BLOCK_TAGS:
                     # If this block wraps nested blocks (e.g. <div>
@@ -550,7 +654,7 @@ class RubySoup:
                 if child.strip():
                     self._process_text_node(child)
             elif isinstance(child, Tag):
-                if child.name in ("ruby", "rt", "rp"):
+                if child.name in ("ruby", "rt", "rp", "rb", "rtc"):
                     continue
                 if child.name in self._BLOCK_TAGS:
                     # If this block wraps nested blocks, recurse instead
@@ -569,6 +673,12 @@ class RubySoup:
         batch_readings, build ruby-annotated replacement, and replace
         the element's children.
 
+        When the block contains **pre-existing <ruby> tags** (author's
+        original annotations for names, special readings, etc.), those
+        tags are PRESERVED.  The LLM is NOT asked to re-annotate words
+        that already have ruby — only unannotated kanji receive new
+        furigana.
+
         Includes a **text integrity check**: after building the annotated
         replacement, the plain-text content is verified to match the
         original.  If verification fails, the element is LEFT UNCHANGED
@@ -582,15 +692,87 @@ class RubySoup:
         if self._llm_reader is not None and not _contains_kanji(text):
             return
 
+        # ── Check for pre-existing ruby tags ──────────────────────
+        has_existing_ruby = self._has_existing_ruby(element)
+        preserved_tags: list[tuple[str, Tag]] = []  # (base_text, tag)
+        pre_annotated_texts: set[str] = set()
+
+        if has_existing_ruby:
+            preserved_tags = self._collect_preserved_ruby_tags(element)
+            pre_annotated_texts = {bt for bt, _ in preserved_tags if bt}
+            if pre_annotated_texts:
+                _logger = logging.getLogger("epub_ruby")
+                _logger.debug(
+                    "Block <%s> has %d pre-existing ruby tag(s): %s",
+                    element.name, len(pre_annotated_texts),
+                    sorted(pre_annotated_texts)[:10],
+                )
+
         base = _get_base_soup()
 
-        if self._llm_reader is not None:
+        # ── Filter batch_readings to exclude pre-annotated words ──
+        if self._llm_reader is not None and pre_annotated_texts:
+            # Build filtered readings for this block: remove any LLM
+            # reading whose key matches a pre-annotated word.
+            # We do this on a COPY so the original batch_readings
+            # (shared across blocks) is not modified.
+            orig_readings = self._batch_readings.get(text, {})
+            filtered_readings: dict[str, str] = {}
+            for word, reading in orig_readings.items():
+                if word in pre_annotated_texts:
+                    continue
+                # Also check if the word is covered by a pre-annotated
+                # text (substring containment in either direction)
+                is_pre_annotated = False
+                for pt in pre_annotated_texts:
+                    if word in pt or pt in word:
+                        is_pre_annotated = True
+                        break
+                if not is_pre_annotated:
+                    filtered_readings[word] = reading
+
+            # Temporarily swap in filtered readings for segmentation
+            saved_readings = self._batch_readings
+            temp_readings = dict(self._batch_readings)
+            temp_readings[text] = filtered_readings
+            self._batch_readings = temp_readings
+
+            segments = list(_generate_readings_from_cache(
+                text, self._batch_readings,
+                batch_readings_norm=self._get_batch_readings_norm(),
+            ))
+            self._batch_readings = saved_readings  # restore
+        elif self._llm_reader is not None:
             segments = list(_generate_readings_from_cache(
                 text, self._batch_readings,
                 batch_readings_norm=self._get_batch_readings_norm(),
             ))
         else:
             segments = list(generate_readings(text))
+
+        # ── Filter segments to de-annotate pre-annotated words ────
+        # In dictionary mode, fugashi annotates ALL kanji including
+        # those that already have ruby in the original EPUB.
+        # Convert those (text, reading) tuples back to plain text so
+        # the merge step can replace them with preserved tags.
+        if pre_annotated_texts:
+            filtered_segments: list = []
+            for seg in segments:
+                if isinstance(seg, tuple):
+                    text_part, _reading = seg
+                    # Check if this word is pre-annotated
+                    is_pre = False
+                    for pt in pre_annotated_texts:
+                        if text_part == pt or text_part in pt or pt in text_part:
+                            is_pre = True
+                            break
+                    if is_pre:
+                        # Emit as plain text — merge step will
+                        # replace with preserved tag
+                        filtered_segments.append(text_part)
+                        continue
+                filtered_segments.append(seg)
+            segments = filtered_segments
 
         # Build replacement children
         new_children: list = []
@@ -614,6 +796,49 @@ class RubySoup:
                     ruby_tag.append(rp_close)
                 new_children.append(ruby_tag)
 
+        # ── Merge preserved ruby tags into new_children ───────────
+        # Pre-annotated words appear as plain text in new_children
+        # (their readings were filtered out).  Walk through and replace
+        # each matching plain-text with the preserved <ruby> tag.
+        # Uses a queue-based approach: preserved tags are consumed in
+        # document order as they are matched.
+        if preserved_tags:
+            p_queue = list(preserved_tags)  # (base_text, tag), FIFO
+            merged: list = []
+
+            for child in new_children:
+                if not isinstance(child, str) or not p_queue:
+                    # Not a plain string or no more tags to preserve
+                    merged.append(child)
+                    continue
+
+                remaining = child  # the plain-text we're scanning
+                while remaining and p_queue:
+                    bt, ptag = p_queue[0]
+                    pos = remaining.find(bt)
+                    if pos == -1:
+                        # This preserved tag not in this segment →
+                        # dump remainder and move on
+                        merged.append(remaining)
+                        remaining = ""
+                        break
+
+                    # Split: text before match → plain
+                    if pos > 0:
+                        merged.append(remaining[:pos])
+                    # The match itself → preserved tag
+                    merged.append(ptag)
+                    self._preserved_ruby_count += 1
+                    p_queue.pop(0)
+
+                    # Continue with text after match
+                    remaining = remaining[pos + len(bt):]
+
+                if remaining:
+                    merged.append(remaining)
+
+            new_children = merged
+
         # ── TEXT INTEGRITY CHECK ──────────────────────────────────
         # Reconstruct the plain text from new_children and verify it
         # matches the original block text.  If not, the annotation
@@ -626,10 +851,15 @@ class RubySoup:
                 # Extract only the BASE text of ruby tags (first child is
                 # the base text; rt/rp content is reading/fallback)
                 if child.name == "ruby":
-                    base_text = "".join(
-                        str(c) for c in child.children
-                        if not (isinstance(c, Tag) and c.name in ("rt", "rp"))
-                    )
+                    base_parts_list = []
+                    for c in child.children:
+                        if isinstance(c, Tag) and c.name in ("rt", "rp", "rtc"):
+                            continue
+                        if isinstance(c, Tag):
+                            base_parts_list.append(c.get_text())
+                        else:
+                            base_parts_list.append(str(c))
+                    base_text = "".join(base_parts_list)
                     rebuilt_parts.append(base_text)
                 else:
                     rebuilt_parts.append(child.get_text())
@@ -665,7 +895,7 @@ class RubySoup:
         # LLM mode, increment the skipped counter for diagnostics.
         if self._llm_reader is not None:
             has_ruby = any(isinstance(s, tuple) for s in segments)
-            if not has_ruby and segments:
+            if not has_ruby and segments and not preserved_tags:
                 self._skipped_count += 1
                 import sys
                 # Show what readings exist for this sentence so we
@@ -713,10 +943,15 @@ class RubySoup:
                     rebuilt_parts.append(seg)
                 elif isinstance(seg, Tag):
                     if seg.name == "ruby":
-                        base_text = "".join(
-                            str(c) for c in seg.children
-                            if not (isinstance(c, Tag) and c.name in ("rt", "rp"))
-                        )
+                        base_parts_list = []
+                        for c in seg.children:
+                            if isinstance(c, Tag) and c.name in ("rt", "rp", "rtc"):
+                                continue
+                            if isinstance(c, Tag):
+                                base_parts_list.append(c.get_text())
+                            else:
+                                base_parts_list.append(str(c))
+                        base_text = "".join(base_parts_list)
                         rebuilt_parts.append(base_text)
                     else:
                         rebuilt_parts.append(seg.get_text())
